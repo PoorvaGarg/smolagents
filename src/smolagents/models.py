@@ -1781,6 +1781,7 @@ class OpenAIModel(ApiModel):
         content = response.choices[0].message.content
         if stop_sequences is not None and not self.supports_stop_parameter:
             content = remove_content_after_stop_sequences(content, stop_sequences)
+        breakpoint()
         return ChatMessage(
             role=response.choices[0].message.role,
             content=content,

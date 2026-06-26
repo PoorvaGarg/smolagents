@@ -132,3 +132,8 @@ The raw thought text is always stored in `step.model_output` (and `step.model_ou
 ### Testing conventions
 
 Tests live in `tests/`. Fixtures are in `tests/fixtures/` (imported as pytest plugins via `conftest.py`). `MultiStepAgent.__init__` is monkeypatched in `conftest.py` to suppress logging by default. Use `shared_datadir` (from `pytest-datadir`) for test data files. Most agent tests mock the model with a `MagicMock` rather than hitting real APIs.
+
+## Collaboration preferences
+
+- **Implement incrementally**: propose and write one small building block at a time so the user can read and review it before moving on. Do not write large monolithic files in a single step.
+- Ask which piece to implement next rather than proceeding automatically.
