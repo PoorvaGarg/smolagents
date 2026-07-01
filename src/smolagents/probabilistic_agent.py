@@ -1,6 +1,8 @@
 import copy
 from typing import Any, Generator
 
+from .monitoring import TokenUsage
+
 
 def _safe_deepcopy(value: Any) -> Any:
     """Deepcopy ``value``, falling back to the original reference if it cannot be copied (e.g. modules, C extensions)."""
@@ -13,107 +15,73 @@ from .agents import ActionOutput, CodeAgent, ToolCall
 from .local_python_executor import fix_final_answer_code
 from .memory import ActionStep
 from .models import ChatMessage, MessageRole
-from .utils import AgentExecutionError, AgentGenerationError, AgentParsingError, parse_code_blobs, truncate_content
+from .utils import AgentGenerationError, AgentParsingError, parse_code_blobs, truncate_content
 
 
 class ProbabilisticCodeAgent(CodeAgent):
-    """CodeAgent where each step samples diverse tool-call arguments before committing.
+    """CodeAgent that samples ``n_samples`` diverse thought+code pairs each step.
 
     For each step:
-      1. Generate one thought + code to identify the intended tool call.
-      2. Extract the first tool call from the code as a template.
-      3. Generate ``n_samples`` alternative argument sets for that tool call.
-      4. If the argument sets are sufficiently diverse, pick one and execute.
-         Otherwise keep sampling until diversity is reached or budget is exhausted.
+      1. Generate ``n_samples`` independent thought+code completions.
+      2. Execute each, observe, and generate the next thought+code.
+      3. Pick the trajectory whose first and second code blocks diverge most.
     """
 
     def __init__(self, *args, n_samples: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
         self.n_samples = n_samples
 
-    def _extract_prefix_tool_call(self, code: str) -> tuple[str, int] | None:
-        """Return (tool_name, open_paren_pos) for the first known tool call in ``code``.
+    def _generate_completions(self, memory_messages: list, n: int) -> list[str]:
+        """Generate ``n`` diverse thought+code outputs using sequential conditioning.
 
-        Scans for the earliest occurrence of any known tool name followed by ``(``.
-        Returns ``None`` if no known tool call is found.
+        Each call sees the previous completions and is asked to try a different approach.
         """
-        first_pos = len(code)
-        first_tool = None
-        for name in self.tools:
-            if name == "final_answer":
-                continue
-            pattern = name + "("
-            idx = code.find(pattern)
-            if idx != -1 and idx < first_pos:
-                first_pos = idx
-                first_tool = name
-
-        if first_tool is None:
-            return None
-
-        open_paren_pos = first_pos + len(first_tool)  # index of '('
-
-        # If the first argument is a keyword arg, extend prefix to right after '='
-        # so completions diverge on the value rather than on the argument name.
-        after_paren = code[open_paren_pos + 1:]
-        eq_idx = after_paren.find("=")
-        first_end = min((i for i in [after_paren.find(","), after_paren.find(")")] if i != -1), default=len(after_paren))
-        if eq_idx != -1 and eq_idx < first_end:
-            return first_tool, open_paren_pos + 1 + eq_idx  # index of '=' in code
-
-        return first_tool, open_paren_pos
-
-    def _generate_completions(
-        self, memory_messages: list, output_prefix: str, n: int
-    ) -> list[str]:
-        """Generate ``n`` completions by prefilling the assistant turn with ``output_prefix``.
-
-        Passes ``n`` directly to the underlying model API (e.g. OpenAI's
-        ``chat.completions.create`` supports this natively).  Each completion
-        diverges from the open parenthesis of the first tool call onward.
-        """
-        messages = memory_messages + [
-            ChatMessage(
-                role=MessageRole.ASSISTANT,
-                content=[{"type": "text", "text": output_prefix}],
-            )
-        ]
-        breakpoint()
         stop_sequences = ["Observation:", self.code_block_tags[1]]
-        response = self.model.generate(messages, stop_sequences=stop_sequences, n=n)
-
         closing_tag = self.code_block_tags[1]
-
-        def _restore(suffix: str) -> str:
-            full = output_prefix + suffix
-            if not full.rstrip().endswith(closing_tag):
-                full += closing_tag
-            return full
-
-        # When n>1 OpenAI returns all choices in response.raw; extract them all.
-        raw = getattr(response, "raw", None)
-        if raw is not None and hasattr(raw, "choices") and len(raw.choices) > 1:
-            for i, ch in enumerate(raw.choices):
-                print(f"\n  [raw choice {i}] content: {repr((ch.message.content or '')[:200])}")
-            return [_restore(choice.message.content or "") for choice in raw.choices]
-        print(f"\n  [raw single choice] content: {repr((response.content or '')[:200])}")
-        return [_restore(response.content or "")]
+        completions = []
+        total_tokens = 0
+        for _ in range(n):
+            messages = memory_messages
+            if completions:
+                prior_codes = []
+                for c in completions:
+                    try:
+                        prior_codes.append(parse_code_blobs(c, self.code_block_tags))
+                    except Exception:
+                        prior_codes.append(c)
+                prior = "\n\n".join(f"```python\n{code}\n```" for code in prior_codes)
+                messages = memory_messages + [
+                    ChatMessage(
+                        role=MessageRole.USER,
+                        content=[{"type": "text", "text": f"The following code approaches have already been tried:\n\n{prior}\n\nGenerate a different approach. Respond with a thought followed by a {self.code_block_tags[0]}...{self.code_block_tags[1]} code block."}],
+                    )
+                ]
+            response = self.model.generate(messages, stop_sequences=stop_sequences)
+            total_tokens += response.token_usage.total_tokens
+            output = response.content or ""
+            if not output.rstrip().endswith(closing_tag):
+                output += closing_tag
+            completions.append(output)
+        # TokenUsage.total_tokens is init=False (computed as input+output), so we store the
+        # running sum in input_tokens and leave output_tokens=0.
+        return completions, TokenUsage(input_tokens=total_tokens, output_tokens=0)
 
     def _generate_trajectories(
-        self, memory_messages: list, output_prefix: str, n: int
-    ) -> list[tuple[str, str, str]]:
-        """For each of ``n`` completions: execute the code, observe, generate next thought+code.
+        self, memory_messages: list, n: int
+    ) -> tuple[list[tuple[str, str, str, bool]], TokenUsage]:
+        """Generate ``n`` trajectories, each a pair of thought+code generations.
 
-        Returns a list of ``(first_output, observation, next_output)`` triples.
-        ``next_output`` is what we compare for similarity across trajectories.
-
-        Each completion is executed from the same executor snapshot so they are
-        independent of each other's side-effects.
+        For each of ``n`` independent completions (thought+code):
+          1. Execute the code and collect the observation.
+          2. Generate a second thought+code given the observation.
+        Returns ``(trajectories, total_token_usage)`` where trajectories is a list of
+        ``(first_output, observation, next_output, is_final)`` 4-tuples.
         """
-        completions = self._generate_completions(memory_messages, output_prefix, n)
+        completions, token_usage = self._generate_completions(memory_messages, n)
         stop_sequences = ["Observation:", self.code_block_tags[1]]
         snapshot = {k: _safe_deepcopy(v) for k, v in self.python_executor.state.items()}
         trajectories = []
+        total_tokens = token_usage.total_tokens
 
         try:
             for completion in completions:
@@ -144,6 +112,7 @@ class ProbabilisticCodeAgent(CodeAgent):
 
                 try:
                     next_response = self.model.generate(next_messages, stop_sequences=stop_sequences)
+                    total_tokens += next_response.token_usage.total_tokens
                     next_output = next_response.content or ""
                     if not next_output.rstrip().endswith(self.code_block_tags[1]):
                         next_output += self.code_block_tags[1]
@@ -156,7 +125,9 @@ class ProbabilisticCodeAgent(CodeAgent):
             self.python_executor.state.clear()
             self.python_executor.state.update(snapshot)
 
-        return trajectories
+        # TokenUsage.total_tokens is init=False (computed as input+output), so we store the
+        # running sum in input_tokens and leave output_tokens=0.
+        return trajectories, TokenUsage(input_tokens=total_tokens, output_tokens=0)
 
     def _trajectory_similarity(self, trajectory: tuple[str, str, str]) -> float:
         """Compute Jaccard similarity between the first and second code blocks in a trajectory.
@@ -216,68 +187,30 @@ class ProbabilisticCodeAgent(CodeAgent):
         return first_output, observation, action_output, is_final_answer
 
     def _step_stream(self, memory_step: ActionStep) -> Generator:
-        """Probabilistic step: sample diverse completions, pick winner, commit."""
+        """Probabilistic step: sample n diverse thought+code pairs, pick winner, commit."""
         memory_messages = self.write_memory_to_messages()
         memory_step.model_input_messages = memory_messages
 
-        stop_sequences = ["Observation:", "Calling tools:"]
-        if self.code_block_tags[1] not in self.code_block_tags[0]:
-            stop_sequences.append(self.code_block_tags[1])
-
-        # Step 1: initial generation to identify the intended tool call.
         try:
-            chat_message = self.model.generate(memory_messages, stop_sequences=stop_sequences)
-            output_text = chat_message.content or ""
-            if not output_text.strip().endswith(self.code_block_tags[1]):
-                output_text += self.code_block_tags[1]
-                chat_message.content = output_text
-            memory_step.model_output_message = chat_message
-            memory_step.model_output = output_text
-            memory_step.token_usage = chat_message.token_usage
-            print("\n=== initial model output ===\n", repr(output_text))
+            trajectories, token_usage = self._generate_trajectories(memory_messages, self.n_samples)
         except Exception as e:
-            raise AgentGenerationError(f"Error generating model output:\n{e}", self.logger) from e
+            raise AgentGenerationError(f"Error generating trajectories:\n{e}", self.logger) from e
+        memory_step.token_usage = token_usage
 
-        # Step 2: parse code and extract the first tool call position.
+        committed = self._pick_and_commit(trajectories)
+        if committed is None:
+            raise AgentGenerationError("No trajectories were generated.", self.logger)
+
+        first_output, observation, action_output, is_final_answer = committed
+
         try:
-            code_action = parse_code_blobs(output_text, self.code_block_tags)
-            code_action = fix_final_answer_code(code_action)
+            code_action = fix_final_answer_code(parse_code_blobs(first_output, self.code_block_tags))
         except Exception as e:
             raise AgentParsingError(f"Error in code parsing:\n{e}", self.logger)
 
-        prefix_result = self._extract_prefix_tool_call(code_action)
-        committed = None
-
-        if prefix_result is not None:
-            _, open_paren_pos = prefix_result
-            code_start = output_text.find(code_action)
-            if code_start != -1:
-                output_prefix = output_text[:code_start + open_paren_pos + 1]
-                # Steps 3-4: sample trajectories, pick the one with most work done.
-                trajectories = self._generate_trajectories(memory_messages, output_prefix, self.n_samples)
-                committed = self._pick_and_commit(trajectories)
-
-        if committed is not None:
-            first_output, observation, action_output, is_final_answer = committed
-            try:
-                code_action = fix_final_answer_code(parse_code_blobs(first_output, self.code_block_tags))
-                memory_step.model_output = first_output
-            except Exception:
-                pass  # keep the original code_action
-            memory_step.observations = observation
-            memory_step.action_output = action_output
-        else:
-            # Fallback: no tool call found or sampling failed — execute the original code.
-            try:
-                code_output = self.python_executor(code_action)
-                observation = "Execution logs:\n" + code_output.logs
-                observation += "\nLast output from code snippet:\n" + truncate_content(str(code_output.output))
-                memory_step.observations = observation
-                memory_step.action_output = code_output.output
-                action_output = code_output.output
-                is_final_answer = code_output.is_final_answer
-            except Exception as e:
-                raise AgentExecutionError(str(e), self.logger)
+        memory_step.model_output = first_output
+        memory_step.observations = observation
+        memory_step.action_output = action_output
 
         tool_call = ToolCall(
             name="python_interpreter",
