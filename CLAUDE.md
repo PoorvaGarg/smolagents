@@ -129,9 +129,45 @@ agent = CodeAgent(..., stream_outputs=True)  # streams full output live
 
 The raw thought text is always stored in `step.model_output` (and `step.model_output_message`) on each `ActionStep` regardless of log level.
 
+### Context pruning (`context_pruning/`)
+
+An experimental subpackage that reduces context bloat from repeated failed tool calls (e.g. many web searches for the same thing). Lives in `src/smolagents/context_pruning/` with a matching test directory `tests/context_pruning/`.
+
+| File | Purpose |
+|---|---|
+| `subtask_detector.py` | Detects subtask boundaries by comparing the primary tool called in consecutive steps. Tools are grouped (`search`, `browse`, `file`); a group change signals a new subtask. |
+| `context_buffer.py` | `SideContextBuffer` — accumulates steps per subtask. On subtask change, only the *last* step of the completed subtask is promoted to committed memory; all prior attempts are dropped. |
+| `pruned_memory.py` | `PrunedMemoryMixin` — overrides `write_memory_to_messages()` to build the LLM prompt from the buffer's pruned view instead of the full `memory.steps` list. |
+| `agent.py` | `ContextPruningCodeAgent` — wires the three above into a `CodeAgent` subclass. Hooks into `_finalize_step` to update the buffer after each step. |
+
+```
+MultiStepAgent
+└── CodeAgent
+    └── ContextPruningCodeAgent  ← PrunedMemoryMixin + CodeAgent
+```
+
 ### Testing conventions
 
 Tests live in `tests/`. Fixtures are in `tests/fixtures/` (imported as pytest plugins via `conftest.py`). `MultiStepAgent.__init__` is monkeypatched in `conftest.py` to suppress logging by default. Use `shared_datadir` (from `pytest-datadir`) for test data files. Most agent tests mock the model with a `MagicMock` rather than hitting real APIs.
+
+## Playground scripts
+
+| Script | Purpose |
+|---|---|
+| `playground/compare_agents.py` | Runs `CodeAgent`, `ContextPruningCodeAgent`, and `ProbabilisticCodeAgent` side-by-side on GAIA or simple tasks and prints per-question steps/tokens/correctness. Requires `OPENAI_API_KEY`. |
+| `playground/summarize_results.py` | Parses raw stdout from `compare_agents.py` and prints per-agent totals (correct count, total steps, total tokens). |
+
+**Run a comparison:**
+```bash
+.venv/bin/python playground/compare_agents.py --tasks gaia --limit 10
+```
+
+**Summarize saved output:**
+```bash
+.venv/bin/python playground/summarize_results.py output.txt
+# or pipe directly:
+.venv/bin/python playground/compare_agents.py --tasks simple | .venv/bin/python playground/summarize_results.py
+```
 
 ## Collaboration preferences
 
