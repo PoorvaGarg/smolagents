@@ -127,6 +127,7 @@ class ChatMessage:
     tool_calls: list[ChatMessageToolCall] | None = None
     raw: Any | None = None  # Stores the raw output from the API
     token_usage: TokenUsage | None = None
+    reasoning: str | None = None  # Chain-of-thought text, for models/providers that return it separately from content
 
     def __post_init__(self) -> None:
         if self.tool_calls is None:
@@ -152,13 +153,17 @@ class ChatMessage:
             tool_calls=data.get("tool_calls"),
             raw=raw,
             token_usage=token_usage,
+            reasoning=data.get("reasoning"),
         )
 
     def dict(self):
         return get_dict_from_nested_dataclasses(self)
 
     def render_as_markdown(self) -> str:
-        rendered = str(self.content) or ""
+        rendered = ""
+        if self.reasoning:
+            rendered += f"**Reasoning:**\n{self.reasoning}\n\n"
+        rendered += str(self.content) or ""
         if self.tool_calls:
             rendered += "\n".join(
                 [
@@ -215,6 +220,7 @@ class ChatMessageStreamDelta:
     content: str | None = None
     tool_calls: list[ChatMessageToolCallStreamDelta] | None = None
     token_usage: TokenUsage | None = None
+    reasoning: str | None = None
 
 
 def agglomerate_stream_deltas(
@@ -225,12 +231,15 @@ def agglomerate_stream_deltas(
     """
     accumulated_tool_calls: dict[int, ChatMessageToolCallStreamDelta] = {}
     accumulated_content = ""
+    accumulated_reasoning = ""
     total_input_tokens = 0
     total_output_tokens = 0
     for stream_delta in stream_deltas:
         if stream_delta.token_usage:
             total_input_tokens += stream_delta.token_usage.input_tokens
             total_output_tokens += stream_delta.token_usage.output_tokens
+        if stream_delta.reasoning:
+            accumulated_reasoning += stream_delta.reasoning
         if stream_delta.content:
             accumulated_content += stream_delta.content
         if stream_delta.tool_calls:
@@ -260,6 +269,7 @@ def agglomerate_stream_deltas(
     return ChatMessage(
         role=role,
         content=accumulated_content,
+        reasoning=accumulated_reasoning or None,
         tool_calls=[
             ChatMessageToolCall(
                 function=ChatMessageToolCallFunction(
@@ -1737,11 +1747,13 @@ class OpenAIModel(ApiModel):
                         output_tokens=event.usage.completion_tokens,
                     ),
                 )
+
             if event.choices:
                 choice = event.choices[0]
                 if choice.delta:
                     yield ChatMessageStreamDelta(
                         content=choice.delta.content,
+                        reasoning=getattr(choice.delta, "reasoning", None),
                         tool_calls=[
                             ChatMessageToolCallStreamDelta(
                                 index=delta.index,
@@ -1784,6 +1796,7 @@ class OpenAIModel(ApiModel):
         return ChatMessage(
             role=response.choices[0].message.role,
             content=content,
+            reasoning=getattr(response.choices[0].message, "reasoning", None),
             tool_calls=response.choices[0].message.tool_calls,
             raw=response,
             token_usage=TokenUsage(

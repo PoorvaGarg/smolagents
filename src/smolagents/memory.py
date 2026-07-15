@@ -43,7 +43,7 @@ class MemoryStep:
     def dict(self):
         return asdict(self)
 
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+    def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:
         raise NotImplementedError
 
 
@@ -89,12 +89,13 @@ class ActionStep(MemoryStep):
             "is_final_answer": self.is_final_answer,
         }
 
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+    def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:
         messages = []
         if self.model_output is not None and not summary_mode:
-            messages.append(
-                ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": self.model_output.strip()}])
-            )
+            content = self.model_output.strip()
+            if include_reasoning and self.model_output_message is not None and self.model_output_message.reasoning:
+                content = f"<think>\n{self.model_output_message.reasoning.strip()}\n</think>\n{content}"
+            messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": content}]))
 
         if self.tool_calls is not None:
             messages.append(
@@ -171,7 +172,7 @@ class PlanningStep(MemoryStep):
             "token_usage": asdict(self.token_usage) if self.token_usage else None,
         }
 
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+    def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:
         if summary_mode:
             return []
         return [
@@ -188,7 +189,7 @@ class TaskStep(MemoryStep):
     task: str
     task_images: list["PIL.Image.Image"] | None = None
 
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+    def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:
         content = [{"type": "text", "text": f"New task:\n{self.task}"}]
         if self.task_images:
             content.extend([{"type": "image", "image": image} for image in self.task_images])
@@ -200,7 +201,7 @@ class TaskStep(MemoryStep):
 class SystemPromptStep(MemoryStep):
     system_prompt: str
 
-    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+    def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:
         if summary_mode:
             return []
         return [ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": self.system_prompt}])]

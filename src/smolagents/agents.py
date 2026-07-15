@@ -350,6 +350,7 @@ class MultiStepAgent(ABC):
         self.monitor = Monitor(self.model, self.logger)
         self._setup_step_callbacks(step_callbacks)
         self.stream_outputs = False
+        self.resend_reasoning = True
 
     @property
     def system_prompt(self) -> str:
@@ -766,7 +767,9 @@ You have been provided with these additional arguments, that you can access dire
         """
         messages = self.memory.system_prompt.to_messages(summary_mode=summary_mode)
         for memory_step in self.memory.steps:
-            messages.extend(memory_step.to_messages(summary_mode=summary_mode))
+            messages.extend(
+                memory_step.to_messages(summary_mode=summary_mode, include_reasoning=self.resend_reasoning)
+            )
         return messages
 
     def _step_stream(
@@ -1235,6 +1238,7 @@ class ToolCallingAgent(MultiStepAgent):
         prompt_templates: PromptTemplates | None = None,
         planning_interval: int | None = None,
         stream_outputs: bool = False,
+        resend_reasoning: bool = True,
         max_tool_threads: int | None = None,
         **kwargs,
     ):
@@ -1254,6 +1258,7 @@ class ToolCallingAgent(MultiStepAgent):
             raise ValueError(
                 "`stream_outputs` is set to True, but the model class implements no `generate_stream` method."
             )
+        self.resend_reasoning = resend_reasoning
         # Tool calling setup
         self.max_tool_threads = max_tool_threads
 
@@ -1536,6 +1541,7 @@ class CodeAgent(MultiStepAgent):
         executor_kwargs: dict[str, Any] | None = None,
         max_print_outputs_length: int | None = None,
         stream_outputs: bool = False,
+        resend_reasoning: bool = True,
         use_structured_outputs_internally: bool = False,
         code_block_tags: str | tuple[str, str] | None = None,
         **kwargs,
@@ -1575,6 +1581,7 @@ class CodeAgent(MultiStepAgent):
             raise ValueError(
                 "`stream_outputs` is set to True, but the model class implements no `generate_stream` method."
             )
+        self.resend_reasoning = resend_reasoning
         if "*" in self.additional_authorized_imports:
             self.logger.log(
                 "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
@@ -1681,6 +1688,12 @@ class CodeAgent(MultiStepAgent):
                 )
                 memory_step.model_output_message = chat_message
                 output_text = chat_message.content
+                if chat_message.reasoning:
+                    self.logger.log_markdown(
+                        content=chat_message.reasoning,
+                        title="Reasoning:",
+                        level=LogLevel.DEBUG,
+                    )
                 self.logger.log_markdown(
                     content=output_text or "",
                     title="Output message of the LLM:",

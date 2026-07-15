@@ -29,6 +29,15 @@ This tool handles the following file extensions: [".html", ".htm", ".xlsx", ".pp
 
         self.md_converter = MarkdownConverter()
 
+    def _call_model(self, messages):
+        # Some providers/models (e.g. Qwen3.7-Plus on Together) reject non-streaming calls outright,
+        # so prefer generate_stream when available rather than always using the plain non-streaming call.
+        if hasattr(self.model, "generate_stream"):
+            from smolagents.models import agglomerate_stream_deltas
+
+            return agglomerate_stream_deltas(list(self.model.generate_stream(messages))).content
+        return self.model(messages).content
+
     def forward_initial_exam_mode(self, file_path, question):
         from smolagents.models import MessageRole
 
@@ -71,7 +80,7 @@ This tool handles the following file extensions: [".html", ".htm", ".xlsx", ".pp
                 ],
             },
         ]
-        return self.model(messages).content
+        return self._call_model(messages)
 
     def forward(self, file_path, question: str | None = None) -> str:
         from smolagents.models import MessageRole
@@ -121,4 +130,4 @@ This tool handles the following file extensions: [".html", ".htm", ".xlsx", ".pp
                 ],
             },
         ]
-        return self.model(messages).content
+        return self._call_model(messages)
