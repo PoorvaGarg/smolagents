@@ -129,6 +129,14 @@ agent = CodeAgent(..., stream_outputs=True)  # streams full output live
 
 The raw thought text is always stored in `step.model_output` (and `step.model_output_message`) on each `ActionStep` regardless of log level.
 
+### Token usage accounting
+
+`step.token_usage` (an `ActionStep`'s `TokenUsage`) is set from that single LLM call's API response (`response.usage.prompt_tokens`/`completion_tokens`, e.g. `models.py:1789`) — it is per-call, not cumulative. Because `write_memory_to_messages()` resends the full step history every call (`agents.py:758`), `input_tokens` still grows step over step; it just isn't a running total, it's the true size of that call's prompt.
+
+The console trajectory line (`[Step N: ... | Input tokens: X | Output tokens: Y]`) and `agent.monitor.get_total_token_counts()` instead show a *cumulative sum* of each step's `token_usage`, computed in `Monitor.update_metrics` (`monitoring.py:100`). Since each step's own `input_tokens` already includes the resent history, this cumulative sum overcounts — it is not the size of the final context window. `step.token_usage` and the Monitor's cumulative total are answering different questions and will only agree on step 1.
+
+Tools that call `self.model(...)` internally (e.g. `TextInspectorTool` in `examples/open_deep_research`) bypass this accounting entirely — their token usage is discarded and never reaches `step.token_usage` or `Monitor`, so true API spend can exceed both numbers.
+
 ### Context pruning (`context_pruning/`)
 
 An experimental subpackage that reduces context bloat from repeated failed tool calls (e.g. many web searches for the same thing). Lives in `src/smolagents/context_pruning/` with a matching test directory `tests/context_pruning/`.

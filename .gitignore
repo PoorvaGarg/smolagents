@@ -9,6 +9,7 @@ outputs
 data/
 *.pkl
 */downloads_folder/*
+*.jsonl
 
 # Apple
 .DS_Store

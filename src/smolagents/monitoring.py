@@ -37,6 +37,11 @@ __all__ = ["AgentLogger", "LogLevel", "Monitor", "TokenUsage", "Timing"]
 class TokenUsage:
     """
     Contains the token usage information for a given step or run.
+
+    When attached to a single `ActionStep` (`step.token_usage`), these counts come straight from that one
+    LLM call's API response and are not cumulative. Since the full message history is resent on every step,
+    `input_tokens` naturally grows step over step — it is not a per-step delta. For a running total across
+    steps, see `Monitor.get_total_token_counts()`.
     """
 
     input_tokens: int
@@ -87,6 +92,13 @@ class Monitor:
         self.total_output_token_count = 0
 
     def get_total_token_counts(self) -> TokenUsage:
+        """
+        Sum of each step's `token_usage` accumulated so far via `update_metrics`. Since each step's own
+        `token_usage.input_tokens` already reflects the full (growing) context sent for that call, this sum
+        is not the size of the final context — it overcounts the shared history resent across calls. It also
+        excludes any model calls made internally by tools (e.g. a tool that calls `self.model(...)` directly),
+        since those never pass through `update_metrics`.
+        """
         return TokenUsage(
             input_tokens=self.total_input_token_count,
             output_tokens=self.total_output_token_count,
