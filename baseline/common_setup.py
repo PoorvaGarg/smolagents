@@ -40,6 +40,13 @@ from scripts.text_web_browser import (
 from scripts.visual_qa import visualizer
 
 
+def assert_no_reasoning(memory_step, agent=None):
+    """Step callback: fail loudly the moment any step returns reasoning despite enable_thinking=False,
+    rather than only noticing it later by eyeballing console output."""
+    reasoning = memory_step.model_output_message.reasoning if memory_step.model_output_message else None
+    assert not reasoning, f"Expected no reasoning (enable_thinking=False) but got: {reasoning!r}"
+
+
 def build_tools(model):
     """Construct the standard GAIA tool stack (search, browser, file inspector, visualizer)."""
     user_agent = (

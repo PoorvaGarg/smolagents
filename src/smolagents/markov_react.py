@@ -24,7 +24,8 @@ class MarkovReActCodeAgent(CodeAgent):
         action_steps = [s for s in self.memory.steps if isinstance(s, ActionStep)]
         for step in task_steps:
             messages.extend(step.to_messages(summary_mode=summary_mode))
-        for step in action_steps[-self.window_size :]:
+        windowed_action_steps = action_steps[-self.window_size :] if self.window_size > 0 else []
+        for step in windowed_action_steps:
             messages.extend(
                 step.to_messages(summary_mode=summary_mode, include_reasoning=self.resend_reasoning)
             )

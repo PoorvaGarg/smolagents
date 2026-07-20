@@ -137,7 +137,7 @@ class AgentGenerationError(AgentError):
     pass
 
 
-def make_json_serializable(obj: Any) -> Any:
+def make_json_serializable(obj: Any, _seen: set[int] | None = None) -> Any:
     """Recursive function to make objects JSON serializable"""
     if obj is None:
         return None
@@ -147,17 +147,30 @@ def make_json_serializable(obj: Any) -> Any:
             try:
                 if (obj.startswith("{") and obj.endswith("}")) or (obj.startswith("[") and obj.endswith("]")):
                     parsed = json.loads(obj)
-                    return make_json_serializable(parsed)
+                    return make_json_serializable(parsed, _seen)
             except json.JSONDecodeError:
                 pass
         return obj
-    elif isinstance(obj, (list, tuple)):
-        return [make_json_serializable(item) for item in obj]
+
+    # Guard against circular references (e.g. SDK response objects with back-references)
+    # that would otherwise blow the recursion limit.
+    _seen = _seen if _seen is not None else set()
+    if id(obj) in _seen:
+        return f"<circular reference to {obj.__class__.__name__}>"
+
+    if isinstance(obj, (list, tuple)):
+        _seen = _seen | {id(obj)}
+        return [make_json_serializable(item, _seen) for item in obj]
     elif isinstance(obj, dict):
-        return {str(k): make_json_serializable(v) for k, v in obj.items()}
+        _seen = _seen | {id(obj)}
+        return {str(k): make_json_serializable(v, _seen) for k, v in obj.items()}
     elif hasattr(obj, "__dict__"):
         # For custom objects, convert their __dict__ to a serializable format
-        return {"_type": obj.__class__.__name__, **{k: make_json_serializable(v) for k, v in obj.__dict__.items()}}
+        _seen = _seen | {id(obj)}
+        return {
+            "_type": obj.__class__.__name__,
+            **{k: make_json_serializable(v, _seen) for k, v in obj.__dict__.items()},
+        }
     else:
         # For any other type, convert to string
         return str(obj)

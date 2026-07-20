@@ -27,6 +27,7 @@ from smolagents.utils import (
     get_source,
     instance_to_source,
     is_valid_name,
+    make_json_serializable,
     parse_code_blobs,
     parse_json_blob,
 )
@@ -552,3 +553,66 @@ def test_agent_gradio_app_template_excludes_class_keyword():
         ast.parse(result)
     except SyntaxError as e:
         pytest.fail(f"Generated app.py contains syntax error: {e}")
+
+
+class DummyNode:
+    def __init__(self, name):
+        self.name = name
+        self.ref = None
+
+
+def test_make_json_serializable_primitives():
+    assert make_json_serializable(None) is None
+    assert make_json_serializable("hello") == "hello"
+    assert make_json_serializable(42) == 42
+    assert make_json_serializable(3.14) == 3.14
+    assert make_json_serializable(True) is True
+
+
+def test_make_json_serializable_nested_containers():
+    obj = {"a": [1, 2, {"b": (3, 4)}]}
+    assert make_json_serializable(obj) == {"a": [1, 2, {"b": [3, 4]}]}
+
+
+def test_make_json_serializable_custom_object():
+    node = DummyNode("root")
+    result = make_json_serializable(node)
+    assert result == {"_type": "DummyNode", "name": "root", "ref": None}
+
+
+def test_make_json_serializable_self_referential_object():
+    """A single object referencing itself must not blow the recursion limit."""
+    node = DummyNode("self")
+    node.ref = node
+
+    result = make_json_serializable(node)
+
+    assert result["_type"] == "DummyNode"
+    assert result["name"] == "self"
+    assert result["ref"] == "<circular reference to DummyNode>"
+
+
+def test_make_json_serializable_mutually_referential_objects():
+    """Two objects referencing each other must not blow the recursion limit."""
+    a = DummyNode("a")
+    b = DummyNode("b")
+    a.ref = b
+    b.ref = a
+
+    result = make_json_serializable(a)
+
+    assert result["name"] == "a"
+    assert result["ref"]["name"] == "b"
+    assert result["ref"]["ref"] == "<circular reference to DummyNode>"
+
+
+def test_make_json_serializable_same_object_on_sibling_branches_not_flagged():
+    """The same object appearing twice on unrelated branches (not a cycle) should
+    still be serialized in full both times, not collapsed as circular."""
+    shared = DummyNode("shared")
+    obj = {"first": shared, "second": shared}
+
+    result = make_json_serializable(obj)
+
+    assert result["first"] == {"_type": "DummyNode", "name": "shared", "ref": None}
+    assert result["second"] == {"_type": "DummyNode", "name": "shared", "ref": None}
