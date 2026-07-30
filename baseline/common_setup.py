@@ -3,6 +3,9 @@
 Used by both naiveReAct.ipynb (CodeAgent) and markovReAct/markovReAct.ipynb
 (MarkovReActCodeAgent) so the two stay directly comparable: same tools, same GAIA
 split, same scorer, same evaluate_agent loop.
+
+evaluate_agent's scorer is pluggable (default: question_scorer) so fermi_setup.py can
+reuse the same loop with fermi_scorer against a different dataset.
 """
 
 import json
@@ -159,6 +162,8 @@ def evaluate_agent(
     n_samples=None,
     output_file="gaia_results.jsonl",
     pickle_dir="gaia_results",
+    scorer=question_scorer,
+    question_suffix=None,
 ):
     examples = dataset.to_list()
     if n_samples:
@@ -197,6 +202,9 @@ def evaluate_agent(
                 )
             augmented_question += prompt_use_files
 
+        if question_suffix:
+            augmented_question += question_suffix
+
         start_time = datetime.now()
         try:
             prediction = str(agent.run(augmented_question, reset=True))
@@ -206,7 +214,7 @@ def evaluate_agent(
             error = str(e)
         time_taken = (datetime.now() - start_time).total_seconds()
 
-        is_correct = question_scorer(prediction, example["true_answer"]) if prediction else False
+        is_correct = scorer(prediction, example["true_answer"]) if prediction else False
 
         action_steps = [s for s in agent.memory.steps if isinstance(s, ActionStep)]
         num_steps = len(action_steps)
