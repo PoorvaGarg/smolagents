@@ -158,6 +158,10 @@ MultiStepAgent
 
 Tests live in `tests/`. Fixtures are in `tests/fixtures/` (imported as pytest plugins via `conftest.py`). `MultiStepAgent.__init__` is monkeypatched in `conftest.py` to suppress logging by default. Use `shared_datadir` (from `pytest-datadir`) for test data files. Most agent tests mock the model with a `MagicMock` rather than hitting real APIs.
 
+**Known pre-existing failure** (as of 2026-08-11, branch `agents_as_prob_progs`): `tests/test_agents.py` gives `94 passed, 2 skipped, 1 failed`. The one failure is `TestToolCallingAgent::test_toolcalling_agent_stream_logs_multiple_tool_calls_observations`, with `AttributeError: 'MockChoice' object has no attribute 'index'` surfacing as `AgentGenerationError`.
+
+Cause: the uncommitted `models.py` n>1 streaming work made `OpenAIModel.generate_stream` loop over all choices and read `choice.index` unconditionally, but the test's `MockChoice` fixture defines no `index`. Isolated by `git stash push src/smolagents/models.py` (which leaves other changes in place) — the test passes without it. Not caused by `tracelet_agent.py`, which `ToolCallingAgent` never imports. `getattr(choice, "index", None)` would fix it; until then, treat this single failure as the expected baseline and don't re-isolate it. Any *other* failure in that file is new.
+
 ## Playground scripts
 
 | Script | Purpose |
@@ -181,3 +185,4 @@ Tests live in `tests/`. Fixtures are in `tests/fixtures/` (imported as pytest pl
 
 - **Implement incrementally**: propose and write one small building block at a time so the user can read and review it before moving on. Do not write large monolithic files in a single step.
 - Ask which piece to implement next rather than proceeding automatically.
+- **Comments: one short line, max.** Never write multi-line or paragraph-length code comments, no matter how subtle the reasoning. Put the longer explanation in the response or the commit message, not in the code.

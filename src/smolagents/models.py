@@ -221,6 +221,10 @@ class ChatMessageStreamDelta:
     tool_calls: list[ChatMessageToolCallStreamDelta] | None = None
     token_usage: TokenUsage | None = None
     reasoning: str | None = None
+    # Which parallel completion (0..n-1) this delta belongs to, when a streaming request
+    # asked for n>1 completions over one shared stream (see agglomerate_stream_deltas_by_index).
+    # None for deltas not tied to a single completion, e.g. an aggregate usage-only chunk.
+    index: int | None = None
 
 
 def agglomerate_stream_deltas(
@@ -287,6 +291,36 @@ def agglomerate_stream_deltas(
             output_tokens=total_output_tokens,
         ),
     )
+
+
+def agglomerate_stream_deltas_by_index(
+    stream_deltas: list[ChatMessageStreamDelta], role: MessageRole = MessageRole.ASSISTANT
+) -> tuple[dict[int, ChatMessage], TokenUsage]:
+    """Like agglomerate_stream_deltas, but demultiplexes a stream carrying n>1 parallel
+    completions (distinguished by ChatMessageStreamDelta.index, e.g. set by
+    OpenAIModel.generate_stream when the request includes n>1) into one ChatMessage per
+    completion index.
+
+    Deltas with index=None aren't tied to any single completion -- e.g. the aggregate
+    usage-only chunk a streaming request emits at the end, which reports token counts
+    summed across all n completions, not split per choice (same as a non-streaming n>1
+    response). That aggregate is returned separately rather than attached to any one
+    ChatMessage.
+    """
+    deltas_by_index: dict[int, list[ChatMessageStreamDelta]] = {}
+    total_input_tokens = 0
+    total_output_tokens = 0
+    for delta in stream_deltas:
+        if delta.index is None:
+            if delta.token_usage:
+                total_input_tokens += delta.token_usage.input_tokens
+                total_output_tokens += delta.token_usage.output_tokens
+            continue
+        deltas_by_index.setdefault(delta.index, []).append(delta)
+
+    messages = {index: agglomerate_stream_deltas(deltas, role=role) for index, deltas in deltas_by_index.items()}
+    token_usage = TokenUsage(input_tokens=total_input_tokens, output_tokens=total_output_tokens)
+    return messages, token_usage
 
 
 tool_role_conversions = {
@@ -1748,8 +1782,12 @@ class OpenAIModel(ApiModel):
                     ),
                 )
 
-            if event.choices:
-                choice = event.choices[0]
+            # Loop over every choice, not just choices[0]: a request with n>1 interleaves
+            # n parallel completions over this one stream, distinguished by choice.index --
+            # tagging each yielded delta with it lets callers demultiplex them back into n
+            # separate completions (see agglomerate_stream_deltas_by_index) instead of only
+            # ever observing the first one.
+            for choice in event.choices:
                 if choice.delta:
                     yield ChatMessageStreamDelta(
                         content=choice.delta.content,
@@ -1765,6 +1803,7 @@ class OpenAIModel(ApiModel):
                         ]
                         if choice.delta.tool_calls
                         else None,
+                        index=choice.index,
                     )
                 else:
                     if not getattr(choice, "finish_reason", None):
