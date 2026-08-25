@@ -160,7 +160,7 @@ Tests live in `tests/`. Fixtures are in `tests/fixtures/` (imported as pytest pl
 
 **Known pre-existing failure** (as of 2026-08-11, branch `agents_as_prob_progs`): `tests/test_agents.py` gives `94 passed, 2 skipped, 1 failed`. The one failure is `TestToolCallingAgent::test_toolcalling_agent_stream_logs_multiple_tool_calls_observations`, with `AttributeError: 'MockChoice' object has no attribute 'index'` surfacing as `AgentGenerationError`.
 
-Cause: the uncommitted `models.py` n>1 streaming work made `OpenAIModel.generate_stream` loop over all choices and read `choice.index` unconditionally, but the test's `MockChoice` fixture defines no `index`. Isolated by `git stash push src/smolagents/models.py` (which leaves other changes in place) — the test passes without it. Not caused by `tracelet_agent.py`, which `ToolCallingAgent` never imports. `getattr(choice, "index", None)` would fix it; until then, treat this single failure as the expected baseline and don't re-isolate it. Any *other* failure in that file is new.
+Cause: the `models.py` n>1 streaming work (committed in `562da82`) made `OpenAIModel.generate_stream` loop over all choices and read `choice.index` unconditionally, but the test's `MockChoice` fixture defines no `index`. Verified by stashing only `models.py` before it was committed — the test passed without it. Not caused by `tracelet_agent.py`, which `ToolCallingAgent` never imports. `getattr(choice, "index", None)` would fix it; until then, treat this single failure as the expected baseline and don't re-investigate it. Any *other* failure in that file is new.
 
 ## Playground scripts
 

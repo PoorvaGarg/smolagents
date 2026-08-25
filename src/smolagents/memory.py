@@ -62,6 +62,8 @@ class ActionStep(MemoryStep):
     action_output: Any = None
     token_usage: TokenUsage | None = None
     is_final_answer: bool = False
+    # Set by TraceletCodeAgent only: sentinels in this step's skeleton (0 = none produced).
+    sentinel_count: int | None = None
 
     def dict(self):
         # We overwrite the method to parse the tool_calls and action_output manually
@@ -87,6 +89,7 @@ class ActionStep(MemoryStep):
             "action_output": make_json_serializable(self.action_output),
             "token_usage": asdict(self.token_usage) if self.token_usage else None,
             "is_final_answer": self.is_final_answer,
+            "sentinel_count": self.sentinel_count,
         }
 
     def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:

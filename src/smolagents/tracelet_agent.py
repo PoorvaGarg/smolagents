@@ -1,6 +1,7 @@
 import ast
 import copy
 import re
+from dataclasses import dataclass
 from typing import Any, Generator, Literal
 
 from .agents import ActionOutput, CodeAgent, ToolCall
@@ -10,10 +11,14 @@ from .models import ChatMessage, MessageRole, agglomerate_stream_deltas, agglome
 from .monitoring import LogLevel, TokenUsage
 from .utils import AgentExecutionError, AgentParsingError, parse_code_blobs, truncate_content
 
+
 # Prefix identifying a sentinel a code skeleton uses in place of a tool-call argument
 # value, to be filled in by _sample_arg_fillins. Sentinels are indexed (ARG0, ARG1, ...)
 # so a tool call with multiple arguments gets one sentinel each.
 ARG_SENTINEL_PREFIX = "ARG"
+
+# Never sentinelized: re-sampling this argument replaces the agent's own answer with a fresh guess.
+FINAL_ANSWER_TOOL_NAME = "final_answer"
 
 
 def _make_sentinel(index: int) -> str:
@@ -25,23 +30,26 @@ def _make_sentinel(index: int) -> str:
 # skeleton itself. No structural guarantee like the AST-based approach -- relies on the
 # model reliably following this instruction.
 _SENTINEL_INSTRUCTION = (
-    "For this step's code, whenever you call one of your provided tools, replace the "
-    "value of each argument to that tool call with a distinct sentinel identifier of the "
-    f"form {_make_sentinel(0)}, {_make_sentinel(1)}, ... -- numbered in the order the "
-    "arguments appear across the whole snippet. The sentinel completely replaces the "
-    "value -- it is not a label, tag, or keyword name attached to the real value, and the "
-    "real value must not appear anywhere in the code.\n\n"
-    f"For a positional argument, write `web_search({_make_sentinel(0)})` instead of "
-    f"`web_search(\"some query\")`.\n"
-    f"For a keyword argument, keep the original keyword name and replace only the value: "
-    f"write `web_search(query={_make_sentinel(0)})` instead of "
-    f"`web_search(query=\"some query\")`.\n\n"
-    f"Do NOT write `web_search({_make_sentinel(0)}=\"some query\")` -- that invents a fake "
-    "keyword name out of the sentinel and still leaves the real value in the code, which "
-    "defeats the purpose.\n\n"
-    "Leave everything else in the code as normal: variable assignments, print statements, "
-    "control flow, and which tool you call. Only replace arguments passed directly to "
-    "tool calls; do not sentinel arguments to other functions (e.g. print, len)."
+    "For this step's code, replace value of certain variables or arguments with indexed sentinel identifiers of the form"
+    "ARG0, ARG1, ... -- numbered in the order the arguments appear across the whole snippet. The sentinel completely replaces"
+    "the value in the code -- it is not a label, tag, or keyword name attached to the real value, and the real value must not appear anywhere in the code."
+    # "For this step's code, whenever you call one of your provided tools, replace the "
+    # "value of each argument to that tool call with a distinct sentinel identifier of the "
+    # f"form {_make_sentinel(0)}, {_make_sentinel(1)}, ... -- numbered in the order the "
+    # "arguments appear across the whole snippet. The sentinel completely replaces the "
+    # "value -- it is not a label, tag, or keyword name attached to the real value, and the "
+    # "real value must not appear anywhere in the code.\n\n"
+    # f"For a positional argument, write `web_search({_make_sentinel(0)})` instead of "
+    # f'`web_search("some query")`.\n'
+    # f"For a keyword argument, keep the original keyword name and replace only the value: "
+    # f"write `web_search(query={_make_sentinel(0)})` instead of "
+    # f'`web_search(query="some query")`.\n\n'
+    # f'Do NOT write `web_search({_make_sentinel(0)}="some query")` -- that invents a fake '
+    # "keyword name out of the sentinel and still leaves the real value in the code, which "
+    # "defeats the purpose.\n\n"
+    # "Leave everything else in the code as normal: variable assignments, print statements, "
+    # "control flow, and which tool you call. Only replace arguments passed directly to "
+    # "tool calls; do not sentinel arguments to other functions (e.g. print, len)."
 )
 
 
@@ -54,13 +62,36 @@ def _safe_deepcopy(value: Any) -> Any:
         return value
 
 
-class _ToolArgSentinelizer(ast.NodeTransformer):
-    """Replaces every argument value in calls to a known tool/managed-agent name with an
-    indexed sentinel identifier. Leaves calls to anything else (print, len, helper
-    variables, ...) untouched, including tool calls nested inside their arguments."""
+# Argument shapes worth sampling: an actual value, rather than a reference to one.
+_SENTINELIZABLE = (ast.Constant, ast.JoinedStr)
 
-    def __init__(self, tool_names: set[str]):
+
+def _single_assignments(tree: ast.Module) -> dict[str, ast.Assign]:
+    """Module-level `name = <expr>` statements, excluding names assigned more than once."""
+    assignments: dict[str, ast.Assign] = {}
+    repeated: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name in assignments:
+                repeated.add(name)
+            assignments[name] = node
+    return {name: node for name, node in assignments.items() if name not in repeated}
+
+
+class _ToolArgSentinelizer(ast.NodeTransformer):
+    """Replaces the values feeding calls to a known tool/managed-agent name with indexed
+    sentinel identifiers. A literal argument is replaced in place; an argument that is a
+    variable assigned a literal earlier in the same snippet has that assignment
+    sentinelized instead, so the sampled value is the one that actually reaches the call.
+    Arguments referring to anything else -- a value computed in an earlier step, a loop
+    variable -- are left alone, since there is nothing meaningful to sample for them.
+    Calls to anything else (print, len, ...) are untouched, including tool calls nested
+    inside their arguments."""
+
+    def __init__(self, tool_names: set[str], assignments: dict[str, ast.Assign]):
         self.tool_names = tool_names
+        self.assignments = assignments
         self.count = 0
 
     def _next_sentinel(self) -> ast.Name:
@@ -68,11 +99,21 @@ class _ToolArgSentinelizer(ast.NodeTransformer):
         self.count += 1
         return node
 
+    def _sentinelize(self, arg: ast.expr, call_lineno: int) -> ast.expr:
+        if isinstance(arg, _SENTINELIZABLE):
+            return ast.copy_location(self._next_sentinel(), arg)
+        if isinstance(arg, ast.Name):
+            assign = self.assignments.get(arg.id)
+            # An already-sentinelized assignment no longer holds a literal, so it is not redone.
+            if assign is not None and assign.lineno < call_lineno and isinstance(assign.value, _SENTINELIZABLE):
+                assign.value = ast.copy_location(self._next_sentinel(), assign.value)
+        return arg
+
     def visit_Call(self, node: ast.Call) -> ast.AST:
         if isinstance(node.func, ast.Name) and node.func.id in self.tool_names:
-            node.args = [ast.copy_location(self._next_sentinel(), arg) for arg in node.args]
+            node.args = [self._sentinelize(arg, node.lineno) for arg in node.args]
             for keyword in node.keywords:
-                keyword.value = ast.copy_location(self._next_sentinel(), keyword.value)
+                keyword.value = self._sentinelize(keyword.value, node.lineno)
             return node
         self.generic_visit(node)
         return node
@@ -81,7 +122,7 @@ class _ToolArgSentinelizer(ast.NodeTransformer):
 def _sentinelize_tool_calls(code: str, tool_names: set[str]) -> str:
     """Parse code, replace tool-call arguments with sentinels, and unparse it back."""
     tree = ast.parse(code)
-    _ToolArgSentinelizer(tool_names).visit(tree)
+    _ToolArgSentinelizer(tool_names, _single_assignments(tree)).visit(tree)
     ast.fix_missing_locations(tree)
     return ast.unparse(tree)
 
@@ -96,6 +137,20 @@ def _find_sentinels(code: str) -> list[str]:
     return seen
 
 
+# Tolerates the wrappers models add around the requested `<sentinel>: <value>` form:
+# leading bullets, surrounding backticks or bold markers, and `=` in place of `:`.
+_FILLIN_LINE_RE = re.compile(
+    rf"^\s*[-*+]?\s*[`*]*({re.escape(ARG_SENTINEL_PREFIX)}\d+)[`*]*\s*[:=]\s*(\S.*?)\s*$",
+)
+
+
+def _strip_wrapping_backticks(value: str) -> str:
+    """Strip backticks wrapping a whole value, leaving backticks inside a literal alone."""
+    if len(value) > 1 and value.startswith("`") and value.endswith("`"):
+        return value.strip("`").strip()
+    return value
+
+
 def _parse_fillin_lines(content: str, sentinels: list[str]) -> dict[str, str]:
     """Parse a completion of the form '<sentinel>: <literal>' (one line per sentinel)
     into a {sentinel: literal} mapping. Lines for unknown or malformed sentinels are
@@ -103,11 +158,37 @@ def _parse_fillin_lines(content: str, sentinels: list[str]) -> dict[str, str]:
     _substitute leaving that sentinel unreplaced."""
     values: dict[str, str] = {}
     for line in (content or "").splitlines():
-        name, sep, value = line.partition(":")
-        name = name.strip()
-        if sep and name in sentinels:
-            values[name] = value.strip()
+        match = _FILLIN_LINE_RE.match(line)
+        if match and match.group(1) in sentinels:
+            values[match.group(1)] = _strip_wrapping_backticks(match.group(2))
     return values
+
+
+def _is_viable(code: str) -> bool:
+    """Whether a substituted candidate can be executed at all: no sentinel survived the
+    substitution, and the result still parses. Deliberately checks the whole candidate
+    rather than each fill-in value, since a sentinel may stand in for a variable
+    reference or f-string, not only a literal."""
+    if _find_sentinels(code):
+        return False
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return False
+    return True
+
+
+@dataclass
+class _Trial:
+    """One trial execution of a candidate: its observation plus the executor state it
+    produced, so committing the winner reuses this snapshot instead of re-executing."""
+
+    code: str
+    observation: str
+    post_state: dict[str, Any] | None = None
+    output: Any = None
+    is_final_answer: bool = False
+    error: str | None = None
 
 
 def _parse_scores(judge_output: str, n: int) -> list[float]:
@@ -152,10 +233,14 @@ class TraceletCodeAgent(CodeAgent):
            ToolCall/ActionOutput.
         """
         memory_messages = self.write_memory_to_messages()
-        memory_step.model_input_messages = memory_messages
+
+        print(len(memory_messages), "memory messages")
+
+        input_messages = memory_messages.copy()
+        memory_step.model_input_messages = input_messages
 
         try:
-            thought, code, code_skeleton, usage = self._sample_skeleton(memory_messages)
+            thought, code, code_skeleton, usage = self._sample_skeleton(input_messages)
         except AgentParsingError as e:
             # The billed call still counts, and the unparseable output must stay visible in memory.
             if getattr(e, "token_usage", None) is not None:
@@ -164,16 +249,25 @@ class TraceletCodeAgent(CodeAgent):
             raise
         total_input, total_output = usage.input_tokens, usage.output_tokens
 
+        # An empty thought is itself a signal, so log a placeholder rather than nothing.
+        self.logger.log_markdown(
+            content=thought if thought.strip() else "<no thought emitted>",
+            title="Thought:",
+            level=LogLevel.DEBUG,
+        )
+
+        # Recorded before the branch so a step that later fails still reports what it produced.
+        memory_step.sentinel_count = len(_find_sentinels(code_skeleton))
+
+        winning_trial = None
         if ARG_SENTINEL_PREFIX not in code_skeleton:
-            winning_code = code
+            winning_code, winning_fillin = code, None
             self.logger.log(
                 "[Tracelet] no tool-call arguments to sample this step -- direct execution "
                 "(no fill-in sampling, no judge).",
                 level=LogLevel.INFO,
             )
         else:
-            # TODO: code (the model's own real argument values) could be reused as a free
-            # first candidate here instead of only sampling n fresh fill-ins.
             num_sentinels = len(_find_sentinels(code_skeleton))
             self.logger.log(
                 f"[Tracelet] {num_sentinels} sentinel(s) found -- sampling {self.n_samples} candidates.",
@@ -184,18 +278,56 @@ class TraceletCodeAgent(CodeAgent):
             total_output += fillin_usage.output_tokens
 
             candidates = [self._substitute(code_skeleton, fillin) for fillin in fillins]
-            trials = self._execute_candidates(candidates)  # list of (code, observation)
+            # (code, fillin) pairs so the winner's fill-in survives viability filtering.
+            viable = [(c, f) for c, f in zip(candidates, fillins) if _is_viable(c)]
+            if len(viable) < len(candidates):
+                self.logger.log(
+                    f"[Tracelet] discarded {len(candidates) - len(viable)}/{len(candidates)} candidate(s) "
+                    "that were unfilled or unparseable.",
+                    level=LogLevel.INFO,
+                )
+            if not viable:
+                # post_process already generated the model's own argument values; falling back to
+                # them makes this step no worse than a plain CodeAgent step.
+                if code != code_skeleton and _is_viable(code):
+                    viable = [(code, None)]
+                    self.logger.log(
+                        "[Tracelet] no usable fill-in -- falling back to the model's own argument values.",
+                        level=LogLevel.INFO,
+                    )
+                else:
+                    unfilled = _find_sentinels(candidates[0]) if candidates else _find_sentinels(code_skeleton)
+                    # Record the skeleton that could not be filled, so this step is not blank in memory.
+                    memory_step.model_output = (
+                        f"{thought}\n{self.code_block_tags[0]}\n{code_skeleton}\n{self.code_block_tags[1]}"
+                    )
+                    raise AgentParsingError(
+                        f"No usable fill-in for {', '.join(unfilled) or 'the skeleton'}. Provide one line per "
+                        f"sentinel of the form `<sentinel>: <value>` for:\n```python\n{code_skeleton}\n```",
+                        self.logger,
+                    )
+            trials = self._execute_candidates([c for c, _ in viable])
 
             winner_index, judge_usage = self._judge_select(thought, trials)
             total_input += judge_usage.input_tokens
             total_output += judge_usage.output_tokens
 
-            winning_code = candidates[winner_index]
+            winning_code, winning_fillin = viable[winner_index]
+            winning_trial = trials[winner_index]
 
         memory_step.token_usage = TokenUsage(input_tokens=total_input, output_tokens=total_output)
 
-        # Record the action before executing it, so a failed execution still leaves it in memory.
-        memory_step.model_output = f"{thought}\n{self.code_block_tags[0]}\n{winning_code}\n{self.code_block_tags[1]}"
+        # Recorded pre-execution; skeleton + 'Fill-in:' form keeps history demonstrating the protocol.
+        if winning_fillin is not None:
+            fillin_lines = "\n".join(f"{s}: {winning_fillin[s]}" for s in _find_sentinels(code_skeleton))
+            memory_step.model_output = (
+                f"{thought}\n{self.code_block_tags[0]}\n{code_skeleton}\n{self.code_block_tags[1]}\n"
+                f"Fill-in:\n{fillin_lines}"
+            )
+        else:
+            memory_step.model_output = (
+                f"{thought}\n{self.code_block_tags[0]}\n{winning_code}\n{self.code_block_tags[1]}"
+            )
         memory_step.code_action = winning_code
         tool_call = ToolCall(
             name="python_interpreter",
@@ -205,7 +337,10 @@ class TraceletCodeAgent(CodeAgent):
         memory_step.tool_calls = [tool_call]
         yield tool_call
 
-        _, observation, action_output, is_final_answer = self._commit(winning_code)
+        if winning_trial is not None:
+            observation, action_output, is_final_answer = self._commit_trial(winning_trial)
+        else:
+            _, observation, action_output, is_final_answer = self._commit(winning_code)
         memory_step.observations = observation
         memory_step.action_output = action_output
         yield ActionOutput(output=action_output, is_final_answer=is_final_answer)
@@ -222,27 +357,14 @@ class TraceletCodeAgent(CodeAgent):
 
     def _generate(self, messages: list[ChatMessage], **kwargs) -> ChatMessage:
         """Single-completion model call that transparently uses streaming when
-        self.stream_outputs is set. Some backends (e.g. Qwen served via TogetherAI)
-        reject non-streaming requests outright with 'This model only supports
-        streaming' -- self.model.generate(...) would fail on them unconditionally.
-        Collects the stream and agglomerates it into one ChatMessage, matching what
-        generate() returns directly, so every other method here can stay agnostic to
-        which path was taken. Unlike CodeAgent._step_stream, doesn't render a live
-        console view of the stream -- deltas are collected, not surfaced to the caller."""
+        self.stream_outputs is set."""
         if self.stream_outputs:
             deltas = list(self.model.generate_stream(messages, **kwargs))
             return agglomerate_stream_deltas(deltas)
         return self.model.generate(messages, **kwargs)
 
     def _sample_skeleton_post_process(self, memory_messages: list[ChatMessage]) -> tuple[str, str, str, TokenUsage]:
-        """Sample (thought, code, code_skeleton, token_usage): one ordinary LLM call,
-        identical to a plain CodeAgent step -- no special instruction. code is the raw
-        generated code with real argument values; code_skeleton is the post-processed
-        version with every tool-call argument replaced by an indexed sentinel (see
-        _sentinelize_tool_calls). code is returned too so its real argument values can be
-        reused later -- e.g. as a free first candidate -- instead of discarding them.
-
-        Structural guarantee: sentinel placement comes from an AST walk against the real
+        """Structural guarantee: sentinel placement comes from an AST walk against the real
         tool registry, not from the model following an instruction. See
         _sample_skeleton_direct_prompt for the alternative."""
         stop_sequences = ["Observation:", "Calling tools:"]
@@ -256,7 +378,7 @@ class TraceletCodeAgent(CodeAgent):
 
         try:
             code = fix_final_answer_code(parse_code_blobs(output_text, self.code_block_tags))
-            tool_names = set(self.tools) | set(self.managed_agents)
+            tool_names = (set(self.tools) | set(self.managed_agents)) - {FINAL_ANSWER_TOOL_NAME}
             code_skeleton = _sentinelize_tool_calls(code, tool_names)
         except Exception as e:
             error_msg = f"Error in code parsing:\n{e}\nMake sure to provide correct code blobs."
@@ -271,13 +393,7 @@ class TraceletCodeAgent(CodeAgent):
     def _sample_skeleton_direct_prompt(self, memory_messages: list[ChatMessage]) -> tuple[str, str, str, TokenUsage]:
         """Sample (thought, code, code_skeleton, token_usage): one LLM call with an added
         instruction (_SENTINEL_INSTRUCTION) asking the model to emit the sentinel-marked
-        skeleton directly, instead of generating real code and post-processing it.
-
-        code and code_skeleton are identical here -- there's no separately-generated
-        real-valued version, so unlike _sample_skeleton_post_process there's nothing to
-        reuse as a free first candidate. Also weaker than the post-process strategy: sentinel
-        placement depends on the model reliably following the instruction, with no
-        structural guarantee."""
+        skeleton directly, instead of generating real code and post-processing it."""
         stop_sequences = ["Observation:", "Calling tools:"]
         if self.code_block_tags[1] not in self.code_block_tags[0]:
             stop_sequences.append(self.code_block_tags[1])
@@ -305,23 +421,7 @@ class TraceletCodeAgent(CodeAgent):
     def _sample_arg_fillins(
         self, memory_messages: list[ChatMessage], code_skeleton: str, n: int
     ) -> tuple[list[dict[str, str]], TokenUsage]:
-        """Sample n candidate fill-ins for code_skeleton's sentinels, in one API call using
-        the provider's `n` parameter (n completions sharing one billed prompt).
-
-        Each fillin is a {sentinel: literal} dict covering every sentinel in the skeleton.
-
-        Non-streaming path: reads the extra completions off the raw API response
-        (ChatMessage.raw) since Model.generate() only surfaces choices[0] itself -- works
-        for OpenAI-compatible backends, not local backends like TransformersModel/MLXModel.
-
-        Streaming path (self.stream_outputs): a request with n>1 interleaves n parallel
-        completions over one stream, distinguished by each delta's index -- see
-        agglomerate_stream_deltas_by_index (models.py) and the corresponding change in
-        OpenAIModel.generate_stream, which used to only ever surface choices[0], silently
-        dropping n-1 completions. Demultiplexing here means streaming-only backends (e.g.
-        Qwen models served via TogetherAI) still get the "prompt billed once" efficiency
-        of the n= path, instead of falling back to n separate single-completion calls.
-        """
+        """Sample n {sentinel: literal} fill-ins for code_skeleton in one API call via the provider's `n`."""
         sentinels = _find_sentinels(code_skeleton)
         instruction = (
             "The following code has tool-call argument values replaced by sentinels:\n\n"
@@ -343,7 +443,7 @@ class TraceletCodeAgent(CodeAgent):
             raw_choices = getattr(response.raw, "choices", None)
             contents = [choice.message.content for choice in raw_choices] if raw_choices else [response.content]
             token_usage = response.token_usage
-
+        print(f"LLM produced: {contents}")
         fillins = [_parse_fillin_lines(content, sentinels) for content in contents]
         return fillins, token_usage
 
@@ -352,15 +452,15 @@ class TraceletCodeAgent(CodeAgent):
         substitution, no LLM call. A sentinel missing from fillin (the model dropped a
         line) is left in place -- it surfaces naturally as a NameError when the candidate
         is executed, handled like any other per-candidate execution failure."""
-        code = code_skeleton
-        for sentinel, value in fillin.items():
-            code = code.replace(sentinel, value)
-        return code
+        # One whole-word pass, so substituting ARG1 can't corrupt ARG10.
+        pattern = rf"\b{re.escape(ARG_SENTINEL_PREFIX)}\d+\b"
+        return re.sub(pattern, lambda m: fillin.get(m.group(0), m.group(0)), code_skeleton)
 
-    def _execute_candidates(self, candidates: list[str]) -> list[tuple[str, str]]:
+    def _execute_candidates(self, candidates: list[str]) -> list[_Trial]:
         """Trial-execute each candidate against a snapshot/restore of executor state (side
-        effects included -- e.g. a real web search per candidate). Returns a list of
-        (code, observation) pairs for the judge; does not mutate live executor state."""
+        effects included -- e.g. a real web search per candidate). Each _Trial captures the
+        post-execution state so committing the winner needs no second execution; live
+        executor state is restored on return."""
         snapshot = {k: _safe_deepcopy(v) for k, v in self.python_executor.state.items()}
         trials = []
         try:
@@ -371,24 +471,26 @@ class TraceletCodeAgent(CodeAgent):
                     code_output = self.python_executor(code)
                     observation = "Execution logs:\n" + code_output.logs
                     observation += "\nLast output from code snippet:\n" + truncate_content(str(code_output.output))
+                    post_state = {k: _safe_deepcopy(v) for k, v in self.python_executor.state.items()}
+                    trials.append(
+                        _Trial(code, observation, post_state, code_output.output, code_output.is_final_answer)
+                    )
                 except Exception as e:
-                    observation = f"Error: {e}"
-                trials.append((code, observation))
+                    trials.append(_Trial(code, f"Error: {e}", error=str(e)))
         finally:
             self.python_executor.state.clear()
             self.python_executor.state.update(snapshot)
         return trials
 
-    def _score_trials(self, thought: str, trials: list[tuple[str, str]]) -> tuple[str, TokenUsage]:
-        """One LLM call: given the current thought and the n (code, observation) trial
-        pairs, ask whether each represents significant progress toward the task and score
-        it. Conditioned on the system prompt + task only, not the full running memory --
-        keeps the judge's context small regardless of how large memory has grown.
-        Returns the judge's raw text output (parsed separately by _pick_best) and
-        token_usage."""
+    def _score_trials(self, thought: str, trials: list[_Trial]) -> tuple[str, TokenUsage]:
+        """One LLM call: given the current thought and the n trials, ask whether each
+        represents significant progress toward the task and score it. Conditioned on the
+        system prompt + task only, not the full running memory -- keeps the judge's
+        context small regardless of how large memory has grown. Returns the judge's raw
+        text output (parsed separately by _pick_best) and token_usage."""
         trials_text = "\n\n".join(
-            f"Candidate {i}:\nThought: {thought}\nAction:\n```python\n{code}\n```\nObservation:\n{observation}"
-            for i, (code, observation) in enumerate(trials)
+            f"Candidate {i}:\nThought: {thought}\nAction:\n```python\n{t.code}\n```\nObservation:\n{t.observation}"
+            for i, t in enumerate(trials)
         )
         instruction = (
             f"Task: {self.task}\n\n"
@@ -415,7 +517,7 @@ class TraceletCodeAgent(CodeAgent):
         scores = _parse_scores(judge_output, n)
         return max(range(n), key=lambda i: scores[i])
 
-    def _judge_select(self, thought: str, trials: list[tuple[str, str]]) -> tuple[int, TokenUsage]:
+    def _judge_select(self, thought: str, trials: list[_Trial]) -> tuple[int, TokenUsage]:
         """Score each trial via one LLM call, then pick the highest-scoring candidate."""
         judge_output, token_usage = self._score_trials(thought, trials)
         winner_index = self._pick_best(judge_output, len(trials))
@@ -425,6 +527,17 @@ class TraceletCodeAgent(CodeAgent):
             level=LogLevel.INFO,
         )
         return winner_index, token_usage
+
+    def _commit_trial(self, trial: _Trial) -> tuple[str, Any, bool]:
+        """Commit the judged winner by installing its saved post-execution state -- no
+        second execution, so single-shot side effects (browser paging, searches) are not
+        repeated. An errored winner surfaces as AgentExecutionError, same as _commit."""
+        self.logger.log_code(title="Committing winning candidate:", content=trial.code, level=LogLevel.INFO)
+        if trial.error is not None:
+            raise AgentExecutionError(trial.error, self.logger)
+        self.python_executor.state.clear()
+        self.python_executor.state.update(trial.post_state)
+        return trial.observation, trial.output, trial.is_final_answer
 
     def _commit(self, code: str) -> tuple[str, str, Any, bool]:
         """Execute code for real against live executor state (the one authoritative
