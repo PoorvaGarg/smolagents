@@ -189,18 +189,32 @@ def evaluate_agent(
         print(f"\n[{i + 1}/{len(examples)}] {example['question'][:100]}...")
 
         augmented_question = example["question"]
+        setup_error = None
         if example["file_name"]:
-            if ".zip" in example["file_name"]:
-                prompt_use_files = "\n\nTo solve the task above, you will have to use these attached files:\n"
-                prompt_use_files += get_zip_description(
-                    example["file_name"], example["question"], visualizer, ti_tool
-                )
-            else:
-                prompt_use_files = "\n\nTo solve the task above, you will have to use this attached file:\n"
-                prompt_use_files += get_single_file_description(
-                    example["file_name"], example["question"], visualizer, ti_tool
-                )
-            augmented_question += prompt_use_files
+            # This calls an LLM API, so a transient network failure here must not abort the whole sweep.
+            for attempt in range(3):
+                try:
+                    if ".zip" in example["file_name"]:
+                        prompt_use_files = "\n\nTo solve the task above, you will have to use these attached files:\n"
+                        prompt_use_files += get_zip_description(
+                            example["file_name"], example["question"], visualizer, ti_tool
+                        )
+                    else:
+                        prompt_use_files = "\n\nTo solve the task above, you will have to use this attached file:\n"
+                        prompt_use_files += get_single_file_description(
+                            example["file_name"], example["question"], visualizer, ti_tool
+                        )
+                    augmented_question += prompt_use_files
+                    setup_error = None
+                    break
+                except Exception as e:
+                    setup_error = str(e)
+                    print(f"  attachment preprocessing attempt {attempt + 1}/3 failed: {e}")
+
+        if setup_error is not None:
+            # No pkl written, so the next run retries this index instead of scoring it wrong.
+            print(f"  ⊘ skipped, will retry on next run | {setup_error}")
+            continue
 
         if question_suffix:
             augmented_question += question_suffix
