@@ -47,6 +47,32 @@ class SimpleTextBrowser:
         self._find_on_page_query: str | None = None
         self._find_on_page_last_result: int | None = None  # Location of the last result
 
+    # Opt-in marker: agents may snapshot/restore this object around trial executions.
+    supports_state_snapshot = True
+
+    _STATE_FIELDS = (
+        "history",
+        "page_title",
+        "viewport_current_page",
+        "viewport_pages",
+        "_page_content",
+        "_find_on_page_query",
+        "_find_on_page_last_result",
+    )
+
+    def get_state(self) -> dict[str, Any]:
+        """Snapshot mutable navigation state only; config and the converter are shared, not restored."""
+        state = {k: getattr(self, k) for k in self._STATE_FIELDS}
+        state["history"] = list(state["history"])
+        state["viewport_pages"] = list(state["viewport_pages"])
+        return state
+
+    def set_state(self, state: dict[str, Any]) -> None:
+        """Restore a get_state snapshot in place, without re-fetching any page."""
+        for k in self._STATE_FIELDS:
+            v = state[k]
+            setattr(self, k, list(v) if k in ("history", "viewport_pages") else v)
+
     @property
     def address(self) -> str:
         """Return the address of the current page."""

@@ -189,6 +189,8 @@ class _Trial:
     output: Any = None
     is_final_answer: bool = False
     error: str | None = None
+    # Post-execution state of stateful tools (e.g. the browser), keyed by tool name.
+    post_tool_state: dict[str, Any] | None = None
 
 
 def _parse_scores(judge_output: str, n: int) -> list[float]:
@@ -273,7 +275,9 @@ class TraceletCodeAgent(CodeAgent):
                 f"[Tracelet] {num_sentinels} sentinel(s) found -- sampling {self.n_samples} candidates.",
                 level=LogLevel.INFO,
             )
-            fillins, fillin_usage = self._sample_arg_fillins(memory_messages, code_skeleton, self.n_samples)
+            fillins, fillin_usage = self._sample_arg_fillins(
+                memory_messages, code_skeleton, self.n_samples, thought
+            )
             total_input += fillin_usage.input_tokens
             total_output += fillin_usage.output_tokens
 
@@ -419,16 +423,18 @@ class TraceletCodeAgent(CodeAgent):
         return thought, code_skeleton, code_skeleton, response.token_usage
 
     def _sample_arg_fillins(
-        self, memory_messages: list[ChatMessage], code_skeleton: str, n: int
+        self, memory_messages: list[ChatMessage], code_skeleton: str, n: int, thought: str = ""
     ) -> tuple[list[dict[str, str]], TokenUsage]:
         """Sample n {sentinel: literal} fill-ins for code_skeleton in one API call via the provider's `n`."""
         sentinels = _find_sentinels(code_skeleton)
+        reasoning_block = f"Your reasoning for this step:\n{thought.strip()}\n\n" if thought.strip() else ""
         instruction = (
-            "The following code has tool-call argument values replaced by sentinels:\n\n"
+            reasoning_block + "The following code has tool-call argument values replaced by sentinels:\n\n"
             f"```python\n{code_skeleton}\n```\n\n"
             "For each sentinel below, respond with exactly one line of the form "
             "`<sentinel>: <value>`, where <value> is a valid Python literal to substitute "
-            "for it. Do not include any other text.\n" + "\n".join(sentinels)
+            "for it. The values must carry out the reasoning above. Do not include any other text.\n"
+            + "\n".join(sentinels)
         )
         messages = memory_messages + [
             ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": instruction}])
@@ -456,30 +462,59 @@ class TraceletCodeAgent(CodeAgent):
         pattern = rf"\b{re.escape(ARG_SENTINEL_PREFIX)}\d+\b"
         return re.sub(pattern, lambda m: fillin.get(m.group(0), m.group(0)), code_skeleton)
 
+    def _stateful_backends(self) -> dict[int, Any]:
+        """Tools, or objects they hold, that opt into snapshotting via supports_state_snapshot plus a
+        get_state/set_state pair. Deduped by identity, since several tools share one backend (e.g.
+        all browser tools share a SimpleTextBrowser)."""
+        found: dict[int, Any] = {}
+        for tool in self.tools.values():
+            for obj in (tool, *vars(tool).values()):
+                if (
+                    getattr(obj, "supports_state_snapshot", False) is True
+                    and callable(getattr(obj, "get_state", None))
+                    and callable(getattr(obj, "set_state", None))
+                ):
+                    found[id(obj)] = obj
+        return found
+
     def _execute_candidates(self, candidates: list[str]) -> list[_Trial]:
-        """Trial-execute each candidate against a snapshot/restore of executor state (side
-        effects included -- e.g. a real web search per candidate). Each _Trial captures the
-        post-execution state so committing the winner needs no second execution; live
-        executor state is restored on return."""
+        """Trial-execute each candidate against a snapshot/restore of executor state and of any
+        stateful tool backend (side effects are still real -- e.g. a web search per candidate).
+        Each _Trial captures the post-execution state so committing the winner needs no second
+        execution; live executor and backend state are restored on return."""
         snapshot = {k: _safe_deepcopy(v) for k, v in self.python_executor.state.items()}
+        backends = self._stateful_backends()
+        backend_snapshot = {key: obj.get_state() for key, obj in backends.items()}
         trials = []
         try:
             for code in candidates:
                 self.python_executor.state.clear()
                 self.python_executor.state.update({k: _safe_deepcopy(v) for k, v in snapshot.items()})
+                # Every candidate starts from the same page, not from where the previous one left off.
+                for key, obj in backends.items():
+                    obj.set_state(backend_snapshot[key])
                 try:
                     code_output = self.python_executor(code)
                     observation = "Execution logs:\n" + code_output.logs
                     observation += "\nLast output from code snippet:\n" + truncate_content(str(code_output.output))
                     post_state = {k: _safe_deepcopy(v) for k, v in self.python_executor.state.items()}
                     trials.append(
-                        _Trial(code, observation, post_state, code_output.output, code_output.is_final_answer)
+                        _Trial(
+                            code,
+                            observation,
+                            post_state,
+                            code_output.output,
+                            code_output.is_final_answer,
+                            post_tool_state={key: obj.get_state() for key, obj in backends.items()},
+                        )
                     )
                 except Exception as e:
                     trials.append(_Trial(code, f"Error: {e}", error=str(e)))
         finally:
             self.python_executor.state.clear()
             self.python_executor.state.update(snapshot)
+            for key, obj in backends.items():
+                obj.set_state(backend_snapshot[key])
         return trials
 
     def _score_trials(self, thought: str, trials: list[_Trial]) -> tuple[str, TokenUsage]:
@@ -537,6 +572,10 @@ class TraceletCodeAgent(CodeAgent):
             raise AgentExecutionError(trial.error, self.logger)
         self.python_executor.state.clear()
         self.python_executor.state.update(trial.post_state)
+        # Leave stateful tools where the winner left them, not where the last candidate did.
+        for key, obj in self._stateful_backends().items():
+            if trial.post_tool_state and key in trial.post_tool_state:
+                obj.set_state(trial.post_tool_state[key])
         return trial.observation, trial.output, trial.is_final_answer
 
     def _commit(self, code: str) -> tuple[str, str, Any, bool]:

@@ -11,6 +11,9 @@ data/
 */downloads_folder/*
 *.jsonl
 *.json
+baseline/downloads_folder_qwen35/*
+baseline/downloads_folder_gpt4o/*
+baseline/downloads_folder*
 
 # Apple
 .DS_Store

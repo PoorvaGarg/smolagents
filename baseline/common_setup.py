@@ -29,6 +29,7 @@ if str(_ODR_DIR) not in sys.path:
 
 from smolagents import DuckDuckGoSearchTool
 from smolagents.memory import ActionStep
+from benchmark_leak_filter import LeakFilteredDuckDuckGoSearchTool
 from scripts.run_agents import get_single_file_description, get_zip_description
 from scripts.text_inspector_tool import TextInspectorTool
 from scripts.text_web_browser import (
@@ -56,18 +57,28 @@ def build_tools(model):
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0"
     )
+    # Overridable so parallel sweeps don't race on identically-named downloads.
+    downloads_dir = os.getenv("SMOLAGENTS_DOWNLOADS_DIR", "downloads_folder")
     browser = SimpleTextBrowser(
         viewport_size=1024 * 5,
-        downloads_folder="downloads_folder",
+        downloads_folder=downloads_dir,
         serpapi_key=os.getenv("SERPAPI_API_KEY"),
         request_kwargs={"headers": {"User-Agent": user_agent}, "timeout": 300},
     )
-    os.makedirs("downloads_folder", exist_ok=True)
+    os.makedirs(downloads_dir, exist_ok=True)
 
     ti_tool = TextInspectorTool(model, text_limit=100000)
 
+    # Answer-key leakage is a defect, so filtering is on by default; set to 0 to reproduce older runs.
+    filter_leaks = os.getenv("SMOLAGENTS_FILTER_LEAKS", "1") == "1"
+    # Lower this when several sweeps run at once, so they don't collectively trip DuckDuckGo throttling.
+    search_rps = float(os.getenv("SMOLAGENTS_SEARCH_RPS", "1.0"))
+    cls = LeakFilteredDuckDuckGoSearchTool if filter_leaks else DuckDuckGoSearchTool
+    search_tool = cls(rate_limit=search_rps)
+    print(f"web_search: {type(search_tool).__name__} at {search_rps} q/s")
+
     tools = [
-        DuckDuckGoSearchTool(),
+        search_tool,
         VisitTool(browser),
         PageUpTool(browser),
         PageDownTool(browser),

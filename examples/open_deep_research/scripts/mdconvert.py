@@ -49,16 +49,18 @@ class _CustomMarkdownify(markdownify.MarkdownConverter):
         # Explicitly cast options to the expected type if necessary
         super().__init__(**options)
 
-    def convert_hn(self, n: int, el: Any, text: str, convert_as_inline: bool) -> str:
+    def convert_hN(self, n: int, el: Any, text: str, parent_tags: Any) -> str:
         """Same as usual, but be sure to start with a new line"""
-        if not convert_as_inline:
+        if "_inline" not in parent_tags:
             if not re.search(r"^\n", text):
-                return "\n" + super().convert_hn(n, el, text, convert_as_inline)  # type: ignore
+                return "\n" + super().convert_hN(n, el, text, parent_tags)  # type: ignore
 
-        return super().convert_hn(n, el, text, convert_as_inline)  # type: ignore
+        return super().convert_hN(n, el, text, parent_tags)  # type: ignore
 
-    def convert_a(self, el: Any, text: str, convert_as_inline: bool):
+    def convert_a(self, el: Any, text: str, parent_tags: Any):
         """Same as usual converter, but removes Javascript links and escapes URIs."""
+        if "_noformat" in parent_tags:
+            return text
         prefix, suffix, text = markdownify.chomp(text)  # type: ignore
         if not text:
             return ""
@@ -89,14 +91,14 @@ class _CustomMarkdownify(markdownify.MarkdownConverter):
         title_part = ' "%s"' % title.replace('"', r"\"") if title else ""
         return "%s[%s](%s%s)%s" % (prefix, text, href, title_part, suffix) if href else text
 
-    def convert_img(self, el: Any, text: str, convert_as_inline: bool) -> str:
+    def convert_img(self, el: Any, text: str, parent_tags: Any) -> str:
         """Same as usual converter, but removes data URIs"""
 
         alt = el.attrs.get("alt", None) or ""
         src = el.attrs.get("src", None) or ""
         title = el.attrs.get("title", None) or ""
         title_part = ' "%s"' % title.replace('"', r"\"") if title else ""
-        if convert_as_inline and el.parent.name not in self.options["keep_inline_images_in"]:
+        if "_inline" in parent_tags and el.parent.name not in self.options["keep_inline_images_in"]:
             return alt
 
         # Remove dataURIs
