@@ -185,8 +185,18 @@ def evaluate_agent(
     pickle_path.mkdir(parents=True, exist_ok=True)
     results = []
 
+    # Tools are built once and reused for every question, so they can't name their own log file
+    # or know which question is running. An explicit log_path (or SMOLAGENTS_LEAK_LOG) wins.
+    drop_loggers = [t for t in agent.tools.values() if getattr(t, "logs_drops", False) is True]
+    for tool in drop_loggers:
+        tool.log_path = tool.log_path or str(pickle_path.parent / f"{pickle_path.name}_leakdrops.jsonl")
+    if drop_loggers:
+        print(f"leak-filter drops logged to: {drop_loggers[0].log_path}")
+
     for i, example in enumerate(examples):
         cache_file = pickle_path / f"{i}.pkl"
+        for tool in drop_loggers:
+            tool.question_idx = i
 
         if cache_file.exists():
             with open(cache_file, "rb") as f:

@@ -1,5 +1,6 @@
 import ast
 import copy
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Generator, Literal
@@ -193,6 +194,38 @@ class _Trial:
     post_tool_state: dict[str, Any] | None = None
 
 
+@dataclass
+class _FillinLogprob:
+    """Sequence logprob of one sampled fill-in, as reported by the provider."""
+
+    logprob: float
+    n_tokens: int
+
+    @property
+    def mean(self) -> float:
+        """Per-token logprob. The sum is length-biased: a longer fill-in is mechanically less probable."""
+        return self.logprob / self.n_tokens if self.n_tokens else 0.0
+
+
+def _softmax(values: list[float]) -> list[float]:
+    """Normalize logprobs to probabilities over the candidate set, max-shifted for stability."""
+    if not values:
+        return []
+    top = max(values)
+    weights = [math.exp(v - top) for v in values]
+    total = sum(weights)
+    return [w / total for w in weights] if total else [1.0 / len(values)] * len(values)
+
+
+def _choice_logprob(choice: Any) -> _FillinLogprob | None:
+    """Sum the per-token logprobs of one completion choice, or None if the provider sent none."""
+    content = getattr(getattr(choice, "logprobs", None), "content", None)
+    if not content:
+        return None
+    values = [t.logprob for t in content if getattr(t, "logprob", None) is not None]
+    return _FillinLogprob(sum(values), len(values)) if values else None
+
+
 def _parse_scores(judge_output: str, n: int) -> list[float]:
     """Parse 'Candidate <i>: <score>' lines into a list of length n, defaulting to 0.0 for
     any candidate the judge didn't score or scored unparseably."""
@@ -216,11 +249,14 @@ class TraceletCodeAgent(CodeAgent):
         *args,
         n_samples: int = 3,
         skeleton_strategy: Literal["post_process", "direct_prompt"] = "post_process",
+        request_logprobs: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.n_samples = n_samples
         self.skeleton_strategy = skeleton_strategy
+        # Turn off for any provider that rejects the `logprobs` argument outright.
+        self.request_logprobs = request_logprobs
 
     def _step_stream(self, memory_step: ActionStep) -> Generator:
         """Orchestrates one Tracelet step.
@@ -275,15 +311,15 @@ class TraceletCodeAgent(CodeAgent):
                 f"[Tracelet] {num_sentinels} sentinel(s) found -- sampling {self.n_samples} candidates.",
                 level=LogLevel.INFO,
             )
-            fillins, fillin_usage = self._sample_arg_fillins(
+            fillins, fillin_logprobs, fillin_usage = self._sample_arg_fillins(
                 memory_messages, code_skeleton, self.n_samples, thought
             )
             total_input += fillin_usage.input_tokens
             total_output += fillin_usage.output_tokens
 
             candidates = [self._substitute(code_skeleton, fillin) for fillin in fillins]
-            # (code, fillin) pairs so the winner's fill-in survives viability filtering.
-            viable = [(c, f) for c, f in zip(candidates, fillins) if _is_viable(c)]
+            # (code, fillin, logprob) triples so the winner's fill-in survives viability filtering.
+            viable = [(c, f, lp) for c, f, lp in zip(candidates, fillins, fillin_logprobs) if _is_viable(c)]
             if len(viable) < len(candidates):
                 self.logger.log(
                     f"[Tracelet] discarded {len(candidates) - len(viable)}/{len(candidates)} candidate(s) "
@@ -294,7 +330,7 @@ class TraceletCodeAgent(CodeAgent):
                 # post_process already generated the model's own argument values; falling back to
                 # them makes this step no worse than a plain CodeAgent step.
                 if code != code_skeleton and _is_viable(code):
-                    viable = [(code, None)]
+                    viable = [(code, None, None)]
                     self.logger.log(
                         "[Tracelet] no usable fill-in -- falling back to the model's own argument values.",
                         level=LogLevel.INFO,
@@ -310,13 +346,15 @@ class TraceletCodeAgent(CodeAgent):
                         f"sentinel of the form `<sentinel>: <value>` for:\n```python\n{code_skeleton}\n```",
                         self.logger,
                     )
-            trials = self._execute_candidates([c for c, _ in viable])
+            trials = self._execute_candidates([c for c, _, _ in viable])
+
+            memory_step.fillin_logprobs = self._log_fillin_probs([lp for _, _, lp in viable])
 
             winner_index, judge_usage = self._judge_select(thought, trials)
             total_input += judge_usage.input_tokens
             total_output += judge_usage.output_tokens
 
-            winning_code, winning_fillin = viable[winner_index]
+            winning_code, winning_fillin, _ = viable[winner_index]
             winning_trial = trials[winner_index]
 
         memory_step.token_usage = TokenUsage(input_tokens=total_input, output_tokens=total_output)
@@ -424,8 +462,11 @@ class TraceletCodeAgent(CodeAgent):
 
     def _sample_arg_fillins(
         self, memory_messages: list[ChatMessage], code_skeleton: str, n: int, thought: str = ""
-    ) -> tuple[list[dict[str, str]], TokenUsage]:
-        """Sample n {sentinel: literal} fill-ins for code_skeleton in one API call via the provider's `n`."""
+    ) -> tuple[list[dict[str, str]], list[_FillinLogprob | None], TokenUsage]:
+        """Sample n {sentinel: literal} fill-ins for code_skeleton in one API call via the provider's `n`.
+
+        Also returns each candidate's sequence logprob where the provider reports one; entries are
+        None on the streaming path, which carries no logprobs through ChatMessageStreamDelta."""
         sentinels = _find_sentinels(code_skeleton)
         reasoning_block = f"Your reasoning for this step:\n{thought.strip()}\n\n" if thought.strip() else ""
         instruction = (
@@ -444,14 +485,33 @@ class TraceletCodeAgent(CodeAgent):
             deltas = list(self.model.generate_stream(messages, n=n))
             messages_by_index, token_usage = agglomerate_stream_deltas_by_index(deltas)
             contents = [messages_by_index[i].content for i in sorted(messages_by_index)]
+            logprobs = [None] * len(contents)
         else:
-            response = self.model.generate(messages, n=n)
+            kwargs = {"logprobs": True} if self.request_logprobs else {}
+            response = self.model.generate(messages, n=n, **kwargs)
             raw_choices = getattr(response.raw, "choices", None)
             contents = [choice.message.content for choice in raw_choices] if raw_choices else [response.content]
+            logprobs = [_choice_logprob(c) for c in raw_choices] if raw_choices else [None]
             token_usage = response.token_usage
         print(f"LLM produced: {contents}")
         fillins = [_parse_fillin_lines(content, sentinels) for content in contents]
-        return fillins, token_usage
+        return fillins, logprobs, token_usage
+
+    def _log_fillin_probs(self, logprobs: list[_FillinLogprob | None]) -> list[dict[str, float]] | None:
+        """Log the candidate distribution and return a picklable record, or None if unreported."""
+        if not any(lp is not None for lp in logprobs):
+            return None
+        # Normalize the length-corrected value: raw sums would just rank by brevity.
+        probs = _softmax([lp.mean if lp else float("-inf") for lp in logprobs])
+        record = [
+            {"logprob": lp.logprob, "n_tokens": lp.n_tokens, "mean_logprob": lp.mean, "prob": p} if lp else {"prob": p}
+            for lp, p in zip(logprobs, probs)
+        ]
+        self.logger.log(
+            "[Tracelet] fill-in probs: " + ", ".join(f"c{i}={p:.3f}" for i, p in enumerate(probs)),
+            level=LogLevel.INFO,
+        )
+        return record
 
     def _substitute(self, code_skeleton: str, fillin: dict[str, str]) -> str:
         """Replace each sentinel in code_skeleton with its value from fillin. Pure string

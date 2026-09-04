@@ -9,7 +9,10 @@ blocking page fetches. URL patterns cover hosts that only ever serve benchmark d
 content markers catch dumps on hosts (like github.com) that also serve legitimate material.
 """
 
+import json
+import os
 import re
+import time
 
 from smolagents import DuckDuckGoSearchTool
 
@@ -51,6 +54,34 @@ def leak_reason(url: str = "", text: str = "") -> str | None:
 class LeakFilteredDuckDuckGoSearchTool(DuckDuckGoSearchTool):
     """DuckDuckGoSearchTool that drops answer-key results and says so, rather than silently."""
 
+    # Marker for the eval loop: this tool wants a log path and the current question index.
+    logs_drops = True
+
+    def __init__(self, *args, log_path: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.log_path = log_path or os.getenv("SMOLAGENTS_LEAK_LOG")
+        self.question_idx = None
+
+    def _log_drops(self, query: str, n_results: int, kept: int, dropped: list) -> None:
+        """Record every search that lost results; the stdout lines below were never captured by nbconvert."""
+        if not self.log_path:
+            return
+        record = {
+            "ts": round(time.time(), 3),
+            "question_idx": self.question_idx,
+            "query": query,
+            "n_results": n_results,
+            "kept": kept,
+            "all_dropped": kept == 0,
+            "dropped": [{"url": r.get("href", ""), "reason": reason} for r, reason in dropped],
+        }
+        try:
+            with open(self.log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            # A logging failure must not abort a 165-question sweep.
+            print(f"  [leak filter] could not write {self.log_path}: {e}")
+
     def forward(self, query: str) -> str:
         self._enforce_rate_limit()
         results = self.ddgs.text(query, max_results=self.max_results)
@@ -66,6 +97,7 @@ class LeakFilteredDuckDuckGoSearchTool(DuckDuckGoSearchTool):
             print(f"  [leak filter] dropped {len(dropped)}/{len(results)} result(s) for '{query[:60]}':")
             for r, reason in dropped:
                 print(f"      {r.get('href', '')[:90]}  ({reason})")
+            self._log_drops(query, len(results), len(kept), dropped)
 
         if not kept:
             raise Exception(

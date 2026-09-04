@@ -10,6 +10,13 @@ All runs below: GAIA `validation`, `max_steps=50`, `enable_thinking=False` for T
 models, launched headless with
 `jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=-1`.
 
+**Streaming changed for Qwen3.5-9B on 2026-09-03.** Every run in the tables below used
+`stream_outputs=True` for both Together models, on the belief that Together rejects non-streaming
+outright. That is true only of Qwen3.7-Plus; Qwen3.5-9B accepts non-streaming with `n=3` and
+reports fill-in logprobs, which the streaming path drops. The tracelet notebooks now set
+`stream_outputs = model_name in {"Qwen/Qwen3.7-Plus"}`, so **new Qwen3.5-9B runs take the
+non-streaming code path and are not strictly config-identical to the ones recorded here.**
+
 Environment variables (added to `common_setup.build_tools` on 2026-09-01/02):
 
 | var | default | meaning |
@@ -17,6 +24,14 @@ Environment variables (added to `common_setup.build_tools` on 2026-09-01/02):
 | `SMOLAGENTS_FILTER_LEAKS` | `1` (on) | drop `web_search` results containing GAIA answer keys (`benchmark_leak_filter.py`) |
 | `SMOLAGENTS_SEARCH_RPS` | `1.0` | DuckDuckGo queries/sec per run; lower it when sweeps run in parallel |
 | `SMOLAGENTS_DOWNLOADS_DIR` | `downloads_folder` | per-run downloads dir, so parallel sweeps don't collide |
+| `SMOLAGENTS_LEAK_LOG` | `<pickle_dir>_leakdrops.jsonl` | where the filter records dropped results; set it only to override the default |
+
+From 2026-09-03 a filter-on run also writes `<pickle_dir>_leakdrops.jsonl`, one JSON record per search
+that lost results: `question_idx`, `query`, `n_results`, `kept`, `all_dropped`, and the dropped
+URLs with the pattern that matched. Runs before that date have no such file — the filter only
+printed to stdout, which nbconvert never saved, so **how often it fired in `_var1/2/3` and the n=3
+runs is unrecoverable**. Join `question_idx` against each pickle's `tool_usage['web_search']` for a
+per-question drop rate.
 
 ## Current baselines — naive CodeAgent, 165 questions
 

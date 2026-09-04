@@ -64,6 +64,8 @@ class ActionStep(MemoryStep):
     is_final_answer: bool = False
     # Set by TraceletCodeAgent only: sentinels in this step's skeleton (0 = none produced).
     sentinel_count: int | None = None
+    # Set by TraceletCodeAgent only: per-candidate fill-in logprobs, None where unreported.
+    fillin_logprobs: list[dict[str, float]] | None = None
 
     def dict(self):
         # We overwrite the method to parse the tool_calls and action_output manually
@@ -90,6 +92,7 @@ class ActionStep(MemoryStep):
             "token_usage": asdict(self.token_usage) if self.token_usage else None,
             "is_final_answer": self.is_final_answer,
             "sentinel_count": self.sentinel_count,
+            "fillin_logprobs": self.fillin_logprobs,
         }
 
     def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:
