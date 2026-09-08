@@ -194,12 +194,19 @@ class _Trial:
     post_tool_state: dict[str, Any] | None = None
 
 
+# OpenAI sends -9999.0 in place of a token's logprob when it cannot report one; summing those
+# yields sums in the millions. Real logprobs never approach this, so anything below is a placeholder.
+PLACEHOLDER_LOGPROB = -1000.0
+
+
 @dataclass
 class _FillinLogprob:
     """Sequence logprob of one sampled fill-in, as reported by the provider."""
 
     logprob: float
     n_tokens: int
+    # Tokens the provider could not score, excluded from the sum above.
+    n_placeholder: int = 0
 
     @property
     def mean(self) -> float:
@@ -223,7 +230,45 @@ def _choice_logprob(choice: Any) -> _FillinLogprob | None:
     if not content:
         return None
     values = [t.logprob for t in content if getattr(t, "logprob", None) is not None]
-    return _FillinLogprob(sum(values), len(values)) if values else None
+    scored = [v for v in values if v > PLACEHOLDER_LOGPROB]
+    return _FillinLogprob(sum(scored), len(scored), len(values) - len(scored)) if scored else None
+
+
+def _index_distribution(response: ChatMessage, n: int) -> list[float] | None:
+    """Probabilities over candidate indices, read from the judge's single-number answer.
+
+    Takes the first emitted token that names a candidate and renormalises that token position's
+    top_logprobs over 0..n-1, so alternatives the model considered become the likelihood. None
+    when the provider reported no logprobs, or named no candidate in its first few tokens."""
+    choices = getattr(response.raw, "choices", None)
+    content = getattr(getattr(choices[0], "logprobs", None), "content", None) if choices else None
+    if not content:
+        return None
+    for token_info in content[:4]:
+        alternatives = getattr(token_info, "top_logprobs", None) or [token_info]
+        probs = [0.0] * n
+        for alt in alternatives:
+            text = (getattr(alt, "token", "") or "").strip()
+            if text.isdigit() and 0 <= int(text) < n:
+                probs[int(text)] += math.exp(alt.logprob)
+        total = sum(probs)
+        if total > 0:
+            return [p / total for p in probs]
+    return None
+
+
+def _normalize_scores(scores: list[float]) -> list[float]:
+    """Treat the judge's 0-10 progress scores as unnormalised weights over candidates.
+
+    The scale is already meant to be proportional -- 8 is twice the progress of 4 -- so dividing
+    by the total preserves that and, unlike the judge's own token logprobs, returns a uniform
+    distribution when the judge rates candidates equally. Negatives are clipped; an all-zero
+    vector (the judge saw no progress anywhere, or nothing parsed) falls back to uniform."""
+    clipped = [max(0.0, s) for s in scores]
+    total = sum(clipped)
+    if total <= 0:
+        return [1.0 / len(scores)] * len(scores) if scores else []
+    return [s / total for s in clipped]
 
 
 def _parse_scores(judge_output: str, n: int) -> list[float]:
@@ -249,12 +294,15 @@ class TraceletCodeAgent(CodeAgent):
         *args,
         n_samples: int = 3,
         skeleton_strategy: Literal["post_process", "direct_prompt"] = "post_process",
+        judge_strategy: Literal["scores", "score_probs", "token_probs"] = "scores",
         request_logprobs: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.n_samples = n_samples
         self.skeleton_strategy = skeleton_strategy
+        # "score_probs" normalises the existing scores into a distribution at no extra token cost.
+        self.judge_strategy = judge_strategy
         # Turn off for any provider that rejects the `logprobs` argument outright.
         self.request_logprobs = request_logprobs
 
@@ -350,9 +398,13 @@ class TraceletCodeAgent(CodeAgent):
 
             memory_step.fillin_logprobs = self._log_fillin_probs([lp for _, _, lp in viable])
 
-            winner_index, judge_usage = self._judge_select(thought, trials)
+            winner_index, judge_scores, judge_usage = self._judge_select(thought, trials)
             total_input += judge_usage.input_tokens
             total_output += judge_usage.output_tokens
+
+            memory_step.candidates = self._record_candidates(
+                trials, [lp for _, _, lp in viable], judge_scores, winner_index
+            )
 
             winning_code, winning_fillin, _ = viable[winner_index]
             winning_trial = trials[winner_index]
@@ -504,7 +556,10 @@ class TraceletCodeAgent(CodeAgent):
         # Normalize the length-corrected value: raw sums would just rank by brevity.
         probs = _softmax([lp.mean if lp else float("-inf") for lp in logprobs])
         record = [
-            {"logprob": lp.logprob, "n_tokens": lp.n_tokens, "mean_logprob": lp.mean, "prob": p} if lp else {"prob": p}
+            {"logprob": lp.logprob, "n_tokens": lp.n_tokens, "mean_logprob": lp.mean,
+             "n_placeholder": lp.n_placeholder, "prob": p}
+            if lp
+            else {"prob": p}
             for lp, p in zip(logprobs, probs)
         ]
         self.logger.log(
@@ -512,6 +567,35 @@ class TraceletCodeAgent(CodeAgent):
             level=LogLevel.INFO,
         )
         return record
+
+    def _record_candidates(
+        self,
+        trials: list[_Trial],
+        logprobs: list[_FillinLogprob | None],
+        judge_scores: list[float],
+        winner_index: int,
+    ) -> list[dict[str, Any]]:
+        """One picklable record per candidate, so a trajectory can be replayed after the run."""
+        probs = _softmax([lp.mean if lp else float("-inf") for lp in logprobs])
+        return [
+            {
+                "code": t.code,
+                # Bounded: a full page of observation per candidate per step would dwarf the pickle.
+                "observation": truncate_content(t.observation or "", 2000),
+                "error": t.error,
+                "fillin_logprob": lp.logprob if lp else None,
+                "fillin_n_tokens": lp.n_tokens if lp else None,
+                "fillin_mean_logprob": lp.mean if lp else None,
+                "fillin_n_placeholder": lp.n_placeholder if lp else None,
+                "fillin_prob": p if lp else None,
+                "judge_score": judge_scores[i] if i < len(judge_scores) else None,
+                # "scores" is 0-10 free text; "distribution" is a categorical likelihood summing to 1.
+                "judge_kind": self.judge_strategy,
+                "won": i == winner_index,
+                "is_final_answer": t.is_final_answer,
+            }
+            for i, (t, lp, p) in enumerate(zip(trials, logprobs, probs))
+        ]
 
     def _substitute(self, code_skeleton: str, fillin: dict[str, str]) -> str:
         """Replace each sentinel in code_skeleton with its value from fillin. Pure string
@@ -605,6 +689,37 @@ class TraceletCodeAgent(CodeAgent):
         response = self._generate(messages)
         return response.content or "", response.token_usage
 
+    def _judge_distribution(self, thought: str, trials: list[_Trial]) -> tuple[list[float] | None, TokenUsage]:
+        """Ask the judge for the single best candidate number, and read the token distribution
+        over the candidate indices as a likelihood over candidates."""
+        trials_text = "\n\n".join(
+            f"Candidate {i}:\nThought: {thought}\nAction:\n```python\n{t.code}\n```\nObservation:\n{t.observation}"
+            for i, t in enumerate(trials)
+        )
+        indices = ", ".join(str(i) for i in range(len(trials)))
+        instruction = (
+            f"Task: {self.task}\n\n"
+            "Below are candidate next steps for this task -- each pairs the same thought "
+            "with a different action and its resulting observation.\n\n"
+            f"{trials_text}\n\n"
+            "Which single candidate makes the most progress toward completing the task? "
+            f"Respond with only its number, one of: {indices}. No other text, no punctuation."
+        )
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": self.system_prompt}]),
+            ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": instruction}]),
+        ]
+        # top_logprobs caps at 5 on OpenAI; the answer is one token, so no output cap is needed.
+        kwargs = {"logprobs": True, "top_logprobs": min(5, max(2, len(trials)))} if self.request_logprobs else {}
+        response = self._generate(messages, **kwargs)
+        likelihoods = _index_distribution(response, len(trials))
+        if likelihoods is None:
+            # No logprobs (streaming providers) -- fall back to the number the judge wrote.
+            match = re.search(r"\d+", response.content or "")
+            if match and 0 <= int(match.group(0)) < len(trials):
+                likelihoods = [1.0 if i == int(match.group(0)) else 0.0 for i in range(len(trials))]
+        return likelihoods, response.token_usage
+
     def _pick_best(self, judge_output: str, n: int) -> int:
         """Aggregate: parse the judge's per-candidate scores and return the index of the
         highest-scoring one. Ties, and total parse failure (all scores default to 0.0),
@@ -612,16 +727,46 @@ class TraceletCodeAgent(CodeAgent):
         scores = _parse_scores(judge_output, n)
         return max(range(n), key=lambda i: scores[i])
 
-    def _judge_select(self, thought: str, trials: list[_Trial]) -> tuple[int, TokenUsage]:
-        """Score each trial via one LLM call, then pick the highest-scoring candidate."""
+    def _judge_select(self, thought: str, trials: list[_Trial]) -> tuple[int, list[float], TokenUsage]:
+        """Pick a winner and return its per-candidate judge values.
+
+        "scores" asks for a 0-10 score per candidate and parses the text. "score_probs" is the
+        same single call with those scores normalised into a distribution -- no extra tokens.
+        "token_probs" instead asks for one number and reads the token distribution over candidate
+        indices; it costs the same but comes out near one-hot, so it carries no uncertainty."""
+        if self.judge_strategy == "token_probs":
+            likelihoods, token_usage = self._judge_distribution(thought, trials)
+            if likelihoods is not None:
+                winner_index = max(range(len(trials)), key=lambda i: likelihoods[i])
+                self.logger.log(
+                    "[Tracelet] judge likelihoods: "
+                    + ", ".join(f"c{i}={p:.3f}" for i, p in enumerate(likelihoods))
+                    + f" -- picked candidate {winner_index}.",
+                    level=LogLevel.INFO,
+                )
+                return winner_index, likelihoods, token_usage
+            self.logger.log(
+                "[Tracelet] judge returned no usable number -- falling back to per-candidate scores.",
+                level=LogLevel.INFO,
+            )
+
         judge_output, token_usage = self._score_trials(thought, trials)
         winner_index = self._pick_best(judge_output, len(trials))
         scores = _parse_scores(judge_output, len(trials))
+        if self.judge_strategy == "score_probs":
+            probs = _normalize_scores(scores)
+            self.logger.log(
+                f"[Tracelet] judge scores: {scores} -> probs: "
+                + ", ".join(f"c{i}={p:.3f}" for i, p in enumerate(probs))
+                + f" -- picked candidate {winner_index}.",
+                level=LogLevel.INFO,
+            )
+            return winner_index, probs, token_usage
         self.logger.log(
             f"[Tracelet] judge scores: {scores} -- picked candidate {winner_index}.",
             level=LogLevel.INFO,
         )
-        return winner_index, token_usage
+        return winner_index, scores, token_usage
 
     def _commit_trial(self, trial: _Trial) -> tuple[str, Any, bool]:
         """Commit the judged winner by installing its saved post-execution state -- no

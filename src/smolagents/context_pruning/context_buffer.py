@@ -22,10 +22,10 @@ class SideContextBuffer:
         """Append *step* to the active subtask context."""
         self.current_context.append(step)
 
-    def commit_subtask(self) -> None:
-        """Close the active subtask: promote its last step to committed memory."""
+    def commit_subtask(self, keep: ActionStep | None = None) -> None:
+        """Close the active subtask, promoting *keep* (default: its last step) to committed memory."""
         if self.current_context:
-            self.committed_steps.append(self.current_context[-1])
+            self.committed_steps.append(keep if keep is not None else self.current_context[-1])
             self.current_context = []
 
     def get_pruned_steps(self) -> list[ActionStep]:

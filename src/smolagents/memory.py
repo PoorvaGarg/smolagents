@@ -66,6 +66,11 @@ class ActionStep(MemoryStep):
     sentinel_count: int | None = None
     # Set by TraceletCodeAgent only: per-candidate fill-in logprobs, None where unreported.
     fillin_logprobs: list[dict[str, float]] | None = None
+    # Set by TraceletCodeAgent only: per-candidate code, observation, fill-in prob, judge score, winner.
+    candidates: list[dict[str, Any]] | None = None
+    # Set by GoalPruningCodeAgent only: the step's declared expectation and P(it was satisfied).
+    expectation: str | None = None
+    completion_prob: float | None = None
 
     def dict(self):
         # We overwrite the method to parse the tool_calls and action_output manually
@@ -93,6 +98,9 @@ class ActionStep(MemoryStep):
             "is_final_answer": self.is_final_answer,
             "sentinel_count": self.sentinel_count,
             "fillin_logprobs": self.fillin_logprobs,
+            "candidates": self.candidates,
+            "expectation": self.expectation,
+            "completion_prob": self.completion_prob,
         }
 
     def to_messages(self, summary_mode: bool = False, include_reasoning: bool = True) -> list[ChatMessage]:

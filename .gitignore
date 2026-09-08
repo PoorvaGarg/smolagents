@@ -16,6 +16,7 @@ baseline/downloads_folder_gpt4o/*
 baseline/downloads_folder*
 baseline/dl_n3_*
 baseline/dl_var*
+baseline/downloads*
 
 # Apple
 .DS_Store

@@ -82,6 +82,63 @@ The n=3 runs also carry two fixes the n=1 runs do not: the browser is snapshotte
 candidate (`SimpleTextBrowser.get_state`/`set_state`), and the leak filter is on. **So n=1 vs n=3
 is not a clean single-variable comparison.**
 
+### `_v6n3` — n=3 with fill-in logprobs (started 2026-09-03)
+
+`_v6n3` = `_v5n3` plus per-candidate fill-in logprobs on `ActionStep.fillin_logprobs`
+(`{logprob, n_tokens, mean_logprob, prob}` per candidate; `prob` is a softmax over the
+length-corrected `mean_logprob`). Fresh directories were required because `evaluate_agent`
+reuses cached pickles, so the completed `_v5n3` runs would have recomputed nothing.
+
+| directory | model | leak filter | search rps | questions | notes |
+|---|---|---|---|---|---|
+| `tracelet_direct_tp_v6n3_react_gpt-4o` | gpt-4o | on | 0.15 | 165 | logprobs |
+| `tracelet_direct_tp_v6n3_react_gpt-5.4-mini` | gpt-5.4-mini | on | 0.15 | 165 | logprobs |
+| `tracelet_direct_tp_v6n3_react_Qwen/Qwen3.5-9B` | Qwen3.5-9B | on | 0.15 | 165 | logprobs, **non-streaming** |
+| `tracelet_direct_tp_v5n3_react_Qwen/Qwen3.7-Plus` | Qwen3.7-Plus | on | 0.15 | resumed 60 → 165 | **no logprobs** |
+
+Qwen3.7-Plus has no `_v6n3` directory on purpose: it is streaming-only and its upstream refuses
+`n>1` together with `logprobs`, so a fresh sweep would have produced no logprob data. Its `_v5n3`
+run was resumed instead, keeping the 60 completed questions. Today's changes do not alter its
+behaviour (it stays on the streaming path, where logprobs are never requested), so the resumed
+dir is internally consistent — but it now also gets a `_leakdrops.jsonl` covering only the
+questions run after the resume.
+
+These runs are the first with drop logging, so each writes `<pickle_dir>_leakdrops.jsonl`.
+
+### `_v6n5` — n=5 (started 2026-09-07)
+
+`N_TAG` is `_n5` here, so directories read `tracelet_direct_n5_tp_v6n5_react_<model>`.
+
+| directory | model | n | leak filter | search rps | questions |
+|---|---|---|---|---|---|
+| `tracelet_direct_n5_tp_v6n5_react_gpt-4o` | gpt-4o | 5 | on | 0.2 | 165 |
+| `tracelet_direct_n5_tp_v6n5_react_gpt-5.4-mini` | gpt-5.4-mini | 5 | on | 0.2 | 165 |
+| `tracelet_direct_n5_tp_v6n5_react_Qwen/Qwen3.5-9B` | Qwen3.5-9B | 5 | on | 0.3 | 165 |
+
+**These are the first runs that record `ActionStep.candidates`** — per-candidate code, truncated
+observation, fill-in logprob/probability, judge score and the winner flag — so they are the only
+runs the trajectory notebook can render in full and the only ones `path_probability` can multiply.
+They also carry the `-9999` placeholder fix (OpenAI sends that value for unscored tokens; 87 of
+3,338 gpt-4o candidate records in `_v6n3` are contaminated and were not repaired retroactively).
+
+**Qwen3.7-Plus has no n=5 run and cannot have one**: its upstream caps `n` at 4
+(`Range of n should be [1, 4]`). It is also streaming-only and refuses `n>1` together with
+`logprobs`, so it produces no fill-in logprobs at any n. Whether it stays in the model set at all
+is an open decision recorded in `TODO.md`.
+
+Capability matrix for replacement candidates, probed 2026-09-07 — only Qwen3.5-9B satisfies all
+three requirements (non-streaming, `n>1` with logprobs, non-reasoning):
+
+| model | non-reasoning | n=5 | logprobs with n>1 |
+|---|---|---|---|
+| `Qwen/Qwen3.5-9B` | yes | yes | yes |
+| `Qwen/Qwen3.7-Plus` | yes | no (cap 4) | no (refused) |
+| `meta-llama/Llama-3.3-70B-Instruct-Turbo` | yes | yes (needs `temperature>0`) | no (silently absent) |
+| `zai-org/GLM-5.3-Flash`, `zai-org/GLM-5.3` | **no** (reasoning cannot be disabled) | yes | yes |
+
+GLM would additionally trip `assert_no_reasoning` in `common_setup.py`, which exists precisely to
+keep reasoning out of these comparisons.
+
 `tracelet_direct_tp_v5n3_react_Qwen/Qwen3.5-9B` was first run to 50 questions and later extended;
 its indices 47-49 errored transiently and were re-run (originals in `_backup_errors/`).
 
