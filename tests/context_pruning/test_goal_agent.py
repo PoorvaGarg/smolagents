@@ -26,9 +26,7 @@ class FakeModel(Model):
 
 
 def make_agent(responses: list[str], **kwargs) -> GoalPruningCodeAgent:
-    return GoalPruningCodeAgent(
-        tools=[], model=FakeModel(responses), max_steps=len(responses) or 1, **kwargs
-    )
+    return GoalPruningCodeAgent(tools=[], model=FakeModel(responses), max_steps=len(responses) or 1, **kwargs)
 
 
 def make_step(number: int, probability: float | None = None) -> ActionStep:
@@ -118,14 +116,18 @@ class TestGoalPruningBoundaries(unittest.TestCase):
         assert buffer.committed_steps == []
         assert [s.step_number for s in buffer.get_pruned_steps()] == [1, 2, 3]
 
-    def test_force_close_at_cap_keeps_the_best_scoring_step(self):
-        agent, _ = self._run_probabilities([0.1, 0.4, 0.2, 0.3], max_open_steps=4)
-        assert [s.step_number for s in agent._ctx_buffer.committed_steps] == [2]
+    def test_nothing_closes_a_subtask_on_step_count(self):
+        # No force-close path: a run whose expectations are never satisfied prunes nothing and
+        # degrades to plain ReAct, rather than discarding steps on a step-count cap.
+        agent, _ = self._run_probabilities([0.0] * 12)
+        assert agent._ctx_buffer.committed_steps == []
+        assert [s.step_number for s in agent._ctx_buffer.get_pruned_steps()] == list(range(1, 13))
 
-    def test_force_close_tie_breaks_to_the_most_recent_step(self):
-        # Every attempt scoring zero is the common case, and argmax alone would keep the first.
-        agent, _ = self._run_probabilities([0.0, 0.0, 0.0, 0.0], max_open_steps=4)
-        assert [s.step_number for s in agent._ctx_buffer.committed_steps] == [4]
+    def test_only_a_judged_success_prunes(self):
+        agent, _ = self._run_probabilities([0.0, 0.1, 0.99, 0.0, 0.2])
+        buffer = agent._ctx_buffer
+        assert [s.step_number for s in buffer.committed_steps] == [3]
+        assert [s.step_number for s in buffer.get_pruned_steps()] == [3, 4, 5]
 
     def test_threshold_is_respected(self):
         agent, _ = self._run_probabilities([0.6], completion_threshold=0.9)
@@ -174,6 +176,18 @@ class TestGoalPruningJudgeWiring(unittest.TestCase):
             assert agent._judge_step(step) == 0.9
         assert step.token_usage.input_tokens == 107
         assert step.token_usage.output_tokens == 21
+
+    def test_monitor_total_includes_the_judge_tokens(self):
+        # The judge must run before super()._finalize_step, which is what feeds the monitor.
+        # evaluate_agent asserts the monitor total equals the sum of per-step token_usage.
+        agent = make_agent([])
+        step = make_step(1)
+        step.model_output = "Expectation: the height\n<code>\npass\n</code>"
+        step.token_usage = TokenUsage(input_tokens=100, output_tokens=20)
+        usage = TokenUsage(input_tokens=700, output_tokens=1)
+        with patch.object(goal_agent, "judge_completion", return_value=(0.9, "yes", usage)):
+            agent._finalize_step(step)
+        assert agent.monitor.get_total_token_counts().total_tokens == step.token_usage.total_tokens == 821
 
     def test_final_answer_step_is_not_judged(self):
         agent = make_agent([])

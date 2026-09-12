@@ -5,6 +5,9 @@ checks whether the observation satisfied it, and a satisfied step closes the sub
 that step and discarding the failed attempts that preceded it. Unsatisfied steps accumulate, so
 while a subtask is still open the agent can see what it already tried.
 
+A judged success is the *only* thing that ever prunes. Nothing closes a subtask on step count, so
+the worst case is that nothing is pruned and the agent runs as plain ReAct.
+
 Differs from ContextPruningCodeAgent, which infers boundaries from tool-group changes and always
 keeps the *last* step of a closed subtask rather than the one that actually succeeded.
 """
@@ -55,11 +58,12 @@ def default_prompt_templates() -> dict:
 class GoalPruningCodeAgent(PrunedMemoryMixin, CodeAgent):
     """CodeAgent that prunes context by goal satisfaction rather than by tool group.
 
+    A subtask closes only when the judge says an expectation was satisfied. There is no cap on
+    how long one may stay open: a trajectory whose expectations are never satisfied keeps its
+    whole history and behaves as plain ReAct, which is the right floor to degrade to.
+
     Args:
         completion_threshold: P(expectation satisfied) at or above which a subtask closes.
-        max_open_steps: force a subtask closed after this many unsatisfied steps, keeping the
-            step that came closest. Without this a permanently-stuck trajectory would retain
-            its whole history and be worse off than with no pruning at all.
         judge_completion_calls: set False to disable the judge and never prune (a control arm).
     """
 
@@ -67,14 +71,12 @@ class GoalPruningCodeAgent(PrunedMemoryMixin, CodeAgent):
         self,
         *args,
         completion_threshold: float = 0.5,
-        max_open_steps: int = 4,
         judge_completion_calls: bool = True,
         prompt_templates: dict | None = None,
         **kwargs,
     ):
         super().__init__(*args, prompt_templates=prompt_templates or default_prompt_templates(), **kwargs)
         self.completion_threshold = completion_threshold
-        self.max_open_steps = max_open_steps
         self.judge_completion_calls = judge_completion_calls
         self._ctx_buffer = SideContextBuffer()
 
@@ -95,10 +97,13 @@ class GoalPruningCodeAgent(PrunedMemoryMixin, CodeAgent):
             code=memory_step.code_action or "",
             observation=memory_step.observations or "",
         )
-        if usage and memory_step.token_usage:
-            memory_step.token_usage.input_tokens += usage.input_tokens
-            memory_step.token_usage.output_tokens += usage.output_tokens
-            memory_step.token_usage.total_tokens += usage.total_tokens
+        if usage:
+            if memory_step.token_usage:
+                memory_step.token_usage.input_tokens += usage.input_tokens
+                memory_step.token_usage.output_tokens += usage.output_tokens
+                memory_step.token_usage.total_tokens += usage.total_tokens
+            else:
+                memory_step.token_usage = usage
         return probability
 
     def _generate_for_judge(self, messages, **kwargs):
@@ -110,10 +115,13 @@ class GoalPruningCodeAgent(PrunedMemoryMixin, CodeAgent):
         return self.model.generate(messages, **kwargs)
 
     def _finalize_step(self, memory_step):
+        # Before super(), because super() runs monitor.update_metrics and the judge's tokens
+        # must already be on the step by then or the monitor's total undercounts them.
+        if isinstance(memory_step, ActionStep):
+            self._judge_and_prune(memory_step)
         super()._finalize_step(memory_step)
-        if not isinstance(memory_step, ActionStep):
-            return
 
+    def _judge_and_prune(self, memory_step: ActionStep):
         memory_step.expectation = parse_expectation(str(memory_step.model_output or ""))
         # The final step ends the run, so judging it would buy nothing.
         if memory_step.is_final_answer:
@@ -131,23 +139,10 @@ class GoalPruningCodeAgent(PrunedMemoryMixin, CodeAgent):
                 f"{len(self._ctx_buffer.committed_steps)} committed step(s).",
                 level=LogLevel.INFO,
             )
-        elif len(self._ctx_buffer.current_context) >= self.max_open_steps:
-            # Ties are the common case here (every attempt scored 0), so fall back to the most
-            # recent step rather than whichever happened to come first.
-            best = max(
-                self._ctx_buffer.current_context,
-                key=lambda s: (s.completion_prob or 0.0, s.step_number),
-            )
-            self._ctx_buffer.commit_subtask(keep=best)
-            self.logger.log(
-                f"[GoalPrune] {self.max_open_steps} steps without satisfying the expectation -- "
-                f"force-closing, keeping step {best.step_number} (p={best.completion_prob or 0.0:.3f}).",
-                level=LogLevel.INFO,
-            )
         else:
             self.logger.log(
                 f"[GoalPrune] expectation not satisfied "
                 f"(p={'n/a' if probability is None else f'{probability:.3f}'}) -- "
-                f"{len(self._ctx_buffer.current_context)}/{self.max_open_steps} steps open.",
+                f"{len(self._ctx_buffer.current_context)} step(s) open.",
                 level=LogLevel.INFO,
             )

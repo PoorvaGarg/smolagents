@@ -1,6 +1,7 @@
 import ast
 import copy
 import math
+import random
 import re
 from dataclasses import dataclass
 from typing import Any, Generator, Literal
@@ -294,7 +295,7 @@ class TraceletCodeAgent(CodeAgent):
         *args,
         n_samples: int = 3,
         skeleton_strategy: Literal["post_process", "direct_prompt"] = "post_process",
-        judge_strategy: Literal["scores", "score_probs", "token_probs"] = "scores",
+        judge_strategy: Literal["scores", "score_probs", "token_probs", "random"] = "scores",
         request_logprobs: bool = True,
         **kwargs,
     ):
@@ -733,7 +734,16 @@ class TraceletCodeAgent(CodeAgent):
         "scores" asks for a 0-10 score per candidate and parses the text. "score_probs" is the
         same single call with those scores normalised into a distribution -- no extra tokens.
         "token_probs" instead asks for one number and reads the token distribution over candidate
-        indices; it costs the same but comes out near one-hot, so it carries no uncertainty."""
+        indices; it costs the same but comes out near one-hot, so it carries no uncertainty.
+        "random" is the control: no judge call at all, uniform pick among viable candidates."""
+        if self.judge_strategy == "random":
+            winner_index = random.randrange(len(trials))
+            uniform = [1.0 / len(trials)] * len(trials)
+            self.logger.log(
+                f"[Tracelet] random selection (control, no judge call) -- picked candidate {winner_index}.",
+                level=LogLevel.INFO,
+            )
+            return winner_index, uniform, TokenUsage(input_tokens=0, output_tokens=0)
         if self.judge_strategy == "token_probs":
             likelihoods, token_usage = self._judge_distribution(thought, trials)
             if likelihoods is not None:

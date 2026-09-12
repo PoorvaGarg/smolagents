@@ -154,6 +154,92 @@ MultiStepAgent
     └── ContextPruningCodeAgent  ← PrunedMemoryMixin + CodeAgent
 ```
 
+### Probabilistic ReAct (`tracelet_agent.py`)
+
+`TraceletCodeAgent` (`src/smolagents/tracelet_agent.py`) treats one ReAct step as a small
+probabilistic program instead of a single greedy generation: sample a code *skeleton* with
+`ARG0`, `ARG1`, ... sentinels in place of tool-call arguments, sample `n_samples` fill-ins for
+those sentinels, execute all `n` resulting candidates, then use an LLM-as-judge to pick a winner.
+Uses `tracelet_agent.yaml` (a template/fill-in protocol prompt) instead of the default
+`code_agent.yaml`.
+
+```
+MultiStepAgent
+└── CodeAgent
+    └── TraceletCodeAgent
+```
+
+Key pieces:
+- `judge_strategy: Literal["scores", "score_probs", "token_probs"]` — how the judge's verdict
+  becomes a selection probability. `"scores"` is a raw 0-10 rating (argmax); `"score_probs"`
+  normalizes those same scores into a distribution at zero extra LLM cost; `"token_probs"` asks
+  for an explicit categorical distribution in one more call.
+- `_FillinLogprob` / `PLACEHOLDER_LOGPROB = -1000.0` — fill-in token logprobs, with unscored
+  tokens (providers send `-9999.0`) excluded from the sum rather than corrupting it.
+- Sentinels only replace **tool-call arguments**, never the plan/skeleton itself — candidate
+  diversity therefore lives entirely in argument values.
+- `ActionStep.candidates` / `.fillin_logprobs` / `.expectation` / `.completion_prob` (in
+  `memory.py`) record enough per step to replay a trajectory offline from a saved pickle, with
+  no model calls — see `baseline/traceletReAct_trajectory.ipynb`.
+
+**Provider quirks**, verified live rather than assumed: OpenAI caps `top_logprobs` at 5 and sends
+`-9999.0` for unscored tokens. Qwen3.7-Plus (served via Together) is streaming-only, caps `n` at
+4, and refuses `n>1` together with `logprobs` — so it never carries fill-in logprob data and
+cannot run the `n=5` arm at all. Qwen3.5-9B works non-streaming with `n=5` **and** logprobs.
+Identical fill-in text can still get different summed logprobs within the same request (up to
+~4 nats apart) — this is lack of batch invariance in the serving kernels, not a bug in this repo;
+see `baseline/logprob_nondeterminism.ipynb`.
+
+### Goal-satisfaction context pruning (`context_pruning/goal_agent.py`)
+
+A second, independent context-pruning design from the tool-group one above. The model states an
+**Expectation** for each step before writing code (via a custom system prompt,
+`prompts/context_pruning_agent.yaml`); a small judge call (`completion_judge.py`) scores
+P(the observation satisfied that expectation); a judged success closes the "subtask", committing
+that step and dropping every open step before it. There is deliberately **no step-count cap** —
+a trajectory whose expectations are never satisfied keeps its whole history and degrades to plain
+ReAct, rather than force-closing on a heuristic (an earlier version did force-close and was
+removed: it discarded the wrong steps, see `TODO.md`).
+
+```
+MultiStepAgent
+└── CodeAgent
+    └── GoalPruningCodeAgent  ← PrunedMemoryMixin + CodeAgent
+```
+
+`baseline/goalPruningReAct.ipynb` runs it on GAIA (env-parameterised like `traceletReAct.ipynb`);
+`baseline/goalPruningTrajectory.ipynb` replays a saved run step-by-step, showing exactly what was
+committed/open/dropped at each point — no model calls needed, since `completion_prob` is recorded
+per step. Tests in `tests/context_pruning/test_goal_agent.py`.
+
+### GAIA benchmark harness (`baseline/`)
+
+Not part of the installed package — a set of notebooks and shared setup for running agents on the
+GAIA validation set and comparing arms. `baseline/common_setup.py` holds `build_tools`,
+`load_gaia_dataset`, `question_scorer`, and `evaluate_agent` (the eval loop all sweep notebooks
+share). `notes.ipynb` is the running analysis notebook; `baseline/RUNS.md` logs what each run
+directory contains (model, n, filter status, search rate, date).
+
+- **Caching**: `evaluate_agent` writes one `{pickle_dir}/{i}.pkl` per question index, skipped on
+  a later run if the file already exists. To force one question to re-run, delete its `.pkl` —
+  everything else is served from cache. There is deliberately no automatic retry inside
+  `evaluate_agent`; recovery from a provider burst is manual: quarantine errored pickles into a
+  `_backup_errors_<date>/` subdirectory inside the run dir, then relaunch with the same
+  `SMOLAGENTS_RUN_TAG` so cached results are reused and only the missing/quarantined indices
+  recompute.
+- **Answer-key leakage** (`baseline/benchmark_leak_filter.py`): GAIA validation answer keys are
+  reachable through ordinary web search (HF Spaces, GitHub eval dumps), which lets naive ReAct
+  read the answer directly out of a search snippet. `LeakFilteredDuckDuckGoSearchTool` drops
+  results matching `leak_reason()`'s patterns; `SMOLAGENTS_FILTER_LEAKS` defaults to **on** (`1`).
+  This is a large, model-dependent confound, not a footnote — e.g. turning it on cost naive
+  gpt-4o -8.9pp and Qwen3.7-Plus -10.3pp, but under -2pp on the other two models. Never compare a
+  filter-off run against a filter-on run without checking `RUNS.md` first.
+- **Liveness**: CPU delta does not distinguish a working run from a hung one (both sit near
+  0.14s CPU per 25s wall time — the work is I/O-bound). Use pickle-count growth and the newest
+  file's mtime instead. A run that survives a laptop sleep typically leaves a *contiguous* block
+  of `Connection error` pickles at the point of interruption — that pattern, not a scattered one,
+  is the signature to look for.
+
 ### Testing conventions
 
 Tests live in `tests/`. Fixtures are in `tests/fixtures/` (imported as pytest plugins via `conftest.py`). `MultiStepAgent.__init__` is monkeypatched in `conftest.py` to suppress logging by default. Use `shared_datadir` (from `pytest-datadir`) for test data files. Most agent tests mock the model with a `MagicMock` rather than hitting real APIs.

@@ -1,20 +1,58 @@
 # TODO
 
 Working list for the `agents_as_prob_progs` branch. Ask me to "check the TODO" and I'll read
-this back and update it. Last updated 2026-09-07.
+this back and update it. Last updated 2026-09-09.
 
 ## Runs in flight
 
-As of 2026-09-07 17:14. All launched detached with `start_new_session`, so they survive a session
-ending; logs in the session scratchpad under `v6n3/` and `v6n5/`.
+As of 2026-09-09 15:25. Everything from the 2026-09-07/08 sweeps has finished except one:
 
-| run | dir | pid | state |
-|---|---|---|---|
-| Qwen3.5-9B n=3 | `tracelet_direct_tp_v6n3_react_Qwen/Qwen3.5-9B` | 59581 | 120/165, 2 errors |
-| Qwen3.7-Plus n=3 | `tracelet_direct_tp_v5n3_react_Qwen/Qwen3.7-Plus` | 59587 | 143/165, 5 errors (~6 are content-filter 400s that reproduce) |
-| gpt-4o n=5 | `tracelet_direct_n5_tp_v6n5_react_gpt-4o` | 59856 | 67/165, 0 errors |
-| gpt-5.4-mini n=5 | `tracelet_direct_n5_tp_v6n5_react_gpt-5.4-mini` | 59873 | 76/165, 0 errors |
-| Qwen3.5-9B n=5 | `tracelet_direct_n5_tp_v6n5_react_Qwen/Qwen3.5-9B` | — | not started; watcher pid 60131 fires it when both n=3 sweeps exit |
+| run | dir | state |
+|---|---|---|
+| n=1 Qwen3.5-9B, filter ON | `tracelet_direct_n1_tp_v7_react_Qwen/Qwen3.5-9B` | 104/165, 4 errors, pid 69204 alive, writing every few minutes |
+
+Everything else — naive/n=1/n=3/n=5 filter-on baselines for all four models, goal-pruning for all
+four models — is at 165/165. Residual error counts, all small and not yet cleaned up: naive
+Qwen3.7-Plus 3, n=1 Qwen3.7-Plus 1, n=3 Qwen3.7-Plus 1, n=5 Qwen3.5-9B 1, goal-pruning Qwen3.7-Plus
+5. Likely the model's known reproducible content-filter 400s rather than transient bursts — check
+before quarantine-and-relaunching them.
+
+**Qwen3.7-Plus n=5 is impossible** — verified live 2026-09-07, not just from notes:
+
+| request | result |
+|---|---|
+| `n=4` | OK |
+| `n=4` + logprobs | `The n parameter must be 1 when logprobs is true` |
+| `n=5` | `Range of n should be [1, 4]` |
+
+Qwen3.5-9B accepts `n=5` **with** logprobs (5 choices returned). So the n=5 arm can only ever span
+three models unless Qwen3.7-Plus is replaced, or every model drops to n=4.
+
+### Laptop-sleep outage, 2026-09-07
+
+Closing the laptop to travel killed the network mid-sweep. Result: **79 `Connection error` pickles
+in contiguous tails** (gpt-4o n=5 idx 97-134, mini n=5 idx 118-164, Qwen3.7-Plus idx 161-164) and
+three processes left alive but wedged with no writes for 170-240 minutes. Recovery: kill the
+wedged pids, move errored pickles to `_backup_errors_20260907/` inside each run dir (not deleted),
+relaunch with the same `RUN_TAG` so the good results stay cached.
+
+**15 of the 79 quarantined errors are deterministic and will re-error**: 7 context-overflow on
+gpt-4o n=5 (idx 79-85), 2 on Qwen3.5-9B n=3 (idx 81-82), and 6 Qwen3.7-Plus content-filter 400s.
+They re-run cheaply because they die fast. Fixing the context ones means truncating the judge
+prompt (below), which changes the method mid-run — so it was deliberately *not* done here.
+
+**Accuracy read off a sweep with many errored pickles is deflated**, since an errored question is
+scored wrong. mini n=5 read 23.9% with 45 errors but 33.1% on its 118 non-errored questions. Check
+the error count before quoting any accuracy.
+
+### Judge prompt is unbounded — the cause of the context overflows
+
+`tracelet_agent.py:671` and `:696` interpolate `{t.observation}` **raw** for every candidate, and
+`code_output.logs` is never truncated either (`:642`; only the "Last output" tail is, at `:643`).
+Only the pickle *record* is bounded, to 2000 chars (`:584`). So the judge prompt scales as
+**n x full observation**: requests of 132k-599k tokens against gpt-4o's 128k limit. n=3 saw 0
+errors across all 165 on gpt-4o — three copies fit, five do not. One-line fix, and it would cut
+judge cost at every n; do it between runs, not during one.
 
 **Health check:** pickle-count growth and newest-write time, *not* CPU (these are I/O bound —
 a working kernel and a hung one both sit near 0.14s CPU per 25s). Recovery from a provider burst
@@ -104,21 +142,65 @@ failed attempts before them.
 | `src/smolagents/prompts/context_pruning_agent.yaml` | custom system prompt, Expectation line in all 12 in-context examples, incl. a retry example that restates the same expectation |
 | `src/smolagents/context_pruning/completion_judge.py` | one small call per step, sees only that step, returns **P(satisfied)** so the threshold is tunable after a run |
 | `src/smolagents/context_pruning/goal_agent.py` | `GoalPruningCodeAgent`, `parse_expectation` |
-| `tests/context_pruning/test_goal_agent.py` | 21 tests; suite is 65 passing |
+| `baseline/goalPruningReAct.ipynb` | GAIA sweep notebook, env-parameterised like `traceletReAct.ipynb` (`SMOLAGENTS_MODEL`, `_RUN_TAG`, `_JUDGE_ON`, `_COMPLETION_THRESHOLD`); `JUDGE_ON=0` is the prompt-only control arm |
 
-Verified end to end on three shaped runs: all-fail (force-close path, pruned to 22%), all-succeed
-(judge path, correctly prunes nothing), and **fail/fail/succeed — dropped both failures, kept the
-successful step, 45% of content**. Judge probes: correct on 5 adversarial negatives including two
-"related but not the thing" cases, and on 4 positives; commit rate on a sample of real trajectory
-steps was ~40-50%.
+**Judge works on all four models** (verified live 2026-09-07). Qwen3.5-9B returns graded logprobs
+(0.997 / 0.0003 on a yes/no pair). Qwen3.7-Plus is streaming-only and `agglomerate_stream_deltas`
+builds a fresh `ChatMessage` with no `raw`, so `_answer_probability` finds nothing and
+`judge_completion` falls back to reading the word — correct verdicts, but binary 1.0/0.0 instead of
+graded. Since the judge is saturated in practice anyway (144/187 gpt-4o probabilities below 0.01),
+that costs almost nothing.
+
+**No `max_tokens` cap on the judge call.** gpt-5.4-mini rejects the parameter outright
+(`Unsupported parameter: 'max_tokens'... use 'max_completion_tokens'`) and smolagents does not
+normalise between the two, so capping it would hard-fail every mini run. The prompt already pins
+the answer to one word and gpt-4o returns exactly 1 output token, so the cap bought nothing.
+| `tests/context_pruning/test_goal_agent.py` | 22 tests; suite is 66 passing |
 
 **`</code>` is a stop sequence** (`agents.py:1659`), so nothing after the code block can ever be
 generated. The Expectation line therefore goes **before** the code, which is also stronger — the
 model commits to it before writing code and cannot retrofit it.
 
+### Force-close removed 2026-09-07
+
+The design originally closed a subtask after `max_open_steps=4` unsatisfied steps, keeping the
+highest-scoring one. **Removed**: a judged success is now the only thing that ever prunes, so the
+worst case is that nothing is pruned and the agent runs as plain ReAct — the right floor.
+
+Why it had to go, from the aborted gpt-4o sweep:
+- The keep rule ranked by `completion_prob`, but that quantity answers *"did this step deliver the
+  expected content"* — which systematically scores **navigation** steps near zero. Measured on q1:
+  a `web_search` returning Wikipedia links scored 0.356 and was kept, while
+  `visit_page(FactSheet.aspx?speciesID=3243)` — the correct page — scored 0.018 and was dropped.
+  The next step re-fetched the identical URL, and the browser said so: *"You previously visited
+  this page 3 seconds ago."*
+- Most probabilities were exactly 0.000, so the `(prob, step_number)` key degenerated to "keep the
+  most recent" — the same defect already logged against the tool-group pruner.
+- **4 of 6 closes were force-closes**, so the path with the weak rule dominated.
+
+### Measured on the 7-question aborted sweep (gpt-4o, force-close still in)
+
+| | goal-pruning | naive gpt-4o |
+|---|---|---|
+| commit rate | **3.9%** (3/76 steps) | — |
+| steps, q0 / q1 | 32 / 46 | 12 / 6 |
+| tokens, q0 / q1 | 296k / 594k | 131k / 33k |
+| last-step input tokens, q0 / q1 | 15.2k / 18.7k | 13.5k / 7.8k |
+
+Prompt compliance was fine (88-100% of steps stated an Expectation) and the judge itself is only
+~9% of the spend. The problem is the **step count**: 8.2 → 39 mean. Pruning does reduce context
+relative to its own step count (~11 committed of 46) but the explosion swamps it, so absolute
+per-step context ended up *higher* than naive. Judge probabilities are saturated — 70/76 below
+0.01, none above 0.99 — so retention is identical at threshold 0.5 and 0.9 and post-hoc threshold
+sweeping buys nothing.
+
 Still to do here:
-- Measure the commit-rate distribution on a real GAIA sweep. If it is near 0% or 100%, nothing
-  else about this design matters. Sweep `completion_threshold` on the recorded probabilities.
+- **Isolate the step explosion.** Two candidate causes, not separated: the Expectation prompt
+  changed the model's behaviour, or pruning destroys context and the agent redoes work.
+  `JUDGE_ON=False` (same prompt, no judge, no pruning) answers it directly. Run both arms on
+  ~15 questions before committing to any 165 sweep — the full run projected to **73M tokens**.
+- Re-measure the commit rate now that force-close is gone. At 3.9% the agent is plain ReAct paying
+  for a judge call every step, which is a strictly-worse configuration.
 - Compare against two free baselines: fixed recent window of *k* steps, and the existing
   tool-group `ContextPruningCodeAgent`. If the judge cannot beat "keep the last 10 steps", the
   call is not earning its keep.
@@ -127,6 +209,87 @@ Still to do here:
 - Consider a `recall(step_number)` tool so pruning is reversible and mistakes are observable.
 - Evaluate on **tokens** (measurable in one run); accuracy is a non-inferiority check only,
   given the ±2.4pp noise floor.
+- `SideContextBuffer.commit_subtask(keep=...)` now has no caller — the argument existed only for
+  force-close. Left in place (tested, one line, shared with the other pruning agent); drop it if
+  you want the dead parameter gone.
+
+## Redundancy-based pruning judge (designed 2026-09-09, not implemented)
+
+Parked to go look at ProbReAct results; pick this up when ready to build the "simple version."
+
+**The bug that motivated it.** Replaying `goalprune_gp1_react_gpt-4o/0.pkl` in
+`goalPruningTrajectory.ipynb` (gpt-4o, force-close already removed): step 12 finds the correct
+arXiv paper (`2206.04615`); step 10 (a content-free "let's summarize and give up" non-action, no
+real tool call) is separately judged satisfied and commits, wiping steps 1-9; step 23 (an unrelated
+"academic database" tangent) is later judged satisfied and commits, wiping steps 11-22 — including
+step 12. Confirmed `2206.04615` never appears in any step's code or thought again after step 23.
+The agent re-searches variations of the same two query families up to 11 times afterward (verified
+via the literal query strings) and hits the 50-step cap without answering. This is
+`commit_subtask()`'s single-survivor design (already logged below) caught in the act, not a
+one-off — and it shows the existing judge question ("did the observation satisfy the expectation")
+is answered per-step with no protection for facts found along the way.
+
+**Design arrived at, after several rejected shapes:**
+- *Rejected: batch reconciliation every step* ("which of the currently-open steps are now
+  redundant, given everything since") — correct in principle but O(n^2) over a trajectory, since
+  the compared set grows every step it's invoked.
+- *Rejected: useful/resolved/ruled-out three-way classification with a one-line summary for ruled-
+  out attempts* — explicitly declined ("I don't want a summarizing step").
+- **Chosen:** one `resolved` check per step ("would the agent need to repeat this action, with
+  different phrasing, to get more or better information?"). If not resolved, the step joins
+  `pending`. If resolved, commit the step to `memory`, then ask **one all-or-nothing question**:
+  "does this step make every one of `pending` unnecessary to redo?" — if yes, wipe `pending`
+  entirely; if no, leave it untouched. A boolean over the whole set is a much higher, safer bar
+  than asking the judge to pick out a specific subset, which just gives it a new way to
+  mis-select and wipe something valuable — the exact failure being fixed.
+
+```python
+system_prompt = ...
+task = ...
+is_final = False
+memory = system_prompt + task
+pending = []
+while not is_final:
+    thought, action = sample(LLM(. | memory + pending))
+    is_final = check(action)
+    if is_final:
+        answer = extract_answer(action)
+    else:
+        result = execute(action)
+        step = (thought, action, result)
+        resolved = sample(LLM(. | task, step,
+                                 "Would the agent need to repeat this action, with "
+                                 "different phrasing, to get more or better information?")) == "no"
+        if not resolved:
+            pending += [step]
+        else:
+            memory += step
+            supersedes_all = sample(LLM(. | task, step, pending,
+                                            "Does this step make every one of these earlier "
+                                            "steps unnecessary to redo?")) == "yes"
+            pending = [] if supersedes_all else pending
+return answer
+```
+
+No Expectation line needed — this judge doesn't check the step against a self-declared goal, so
+the custom `context_pruning_agent.yaml` prompt could likely be dropped in favour of plain
+`code_agent.yaml`, removing that confound rather than needing `JUDGE_ON=False` to isolate it.
+
+**Known, measured limitation: doesn't compress interleaved multi-part questions.** The all-or-
+nothing gate only fires cleanly when `pending` holds one line of inquiry at a time. Measured on
+`naive_react_gpt-4o_False_fixedbrowser` (165 questions, unpruned, so this is the model's natural
+work pattern): a crude `" and "`-split heuristic found 22/165 (13%) structurally two-part — an
+undercount, since q0 itself is two-part but phrased without "and" and wasn't even caught. Of those
+22, **7 (32%) showed genuine interleaving** (>=2 thread switches, not just "finish A then start
+B") — q155 switched threads 9 times over 51 steps. So roughly 4-5% of GAIA overall gets zero
+compression benefit from this design; accepted as a v1 limitation rather than adding thread-scoped
+`pending` lists, which would reintroduce the subtask-detection complexity this is trying to avoid.
+
+Next step when resumed: implement as a new judge module (two calls: `resolved`, then
+`supersedes_all` only when resolved), wire into a `GoalPruningCodeAgent` variant with
+`prompt_templates=None`, and replay it against `goalprune_gp1_react_gpt-4o/0.pkl`'s question
+specifically to confirm `2206.04615` survives while the AI-regulation search family gets dropped
+once step 11 succeeds.
 
 ## Known defects and debt
 
@@ -136,7 +299,13 @@ Still to do here:
   on a line with two tool calls varies between processes, so pruning is not reproducible.
 - **Context pruning prunes the wrong group hardest.** 54-56% of dropped steps are `browse` chains,
   where consecutive views hold *different* content; only 20-33% are the redundant repeated
-  searches its docstring targets. It also keeps the *last* step of a segment, not the best.
+  searches its docstring targets. It also keeps the *last* step of a segment, not the best. The
+  goal-pruning agent hit the same "keeps the wrong step" failure via its force-close path, now
+  removed.
+- **A judged success keeps the step that satisfied it, which may not be the step worth keeping.**
+  `commit_subtask()` promotes `current_context[-1]`. That is right when the satisfying step also
+  holds the content, but a step whose expectation was met by a *summary* still discards the
+  navigation steps that produced it.
 - **`-9999` placeholder contamination.** OpenAI sends `-9999.0` for unscored tokens; 87 of 3,338
   gpt-4o candidate records in `_v6n3` are affected. Fixed going forward (`n_placeholder`), but the
   existing pickles are not repaired.
@@ -146,10 +315,11 @@ Still to do here:
 
 ## Uncommitted
 
-- `src/smolagents/tracelet_agent.py`, `src/smolagents/memory.py` — judge strategies
-  (`scores` / `score_probs` / `token_probs`), `ActionStep.candidates`, placeholder fix
-- `baseline/traceletReAct_trajectory.ipynb` — new, untracked
-- `baseline/RUNS.md` — `_v6n5` runs not yet recorded
+- `src/smolagents/context_pruning/goal_agent.py` — force-close path removed
+- `src/smolagents/context_pruning/completion_judge.py` — `max_tokens=4` cap on the judge call
+- `tests/context_pruning/test_goal_agent.py` — force-close tests replaced by the ReAct-floor
+  tests, plus a regression test that the monitor total includes the judge's tokens
+- `baseline/goalPruningReAct.ipynb` — new, untracked
 
 ## Measurement rules established this session
 

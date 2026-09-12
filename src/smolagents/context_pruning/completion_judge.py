@@ -98,7 +98,8 @@ def judge_completion(
         messages.append(ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": system_prompt}]))
     messages.append(ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": instruction}]))
 
-    # top_logprobs caps at 5 on OpenAI; the answer is one token so no output cap is needed.
+    # No max_tokens cap: gpt-5.4-mini rejects it (wants max_completion_tokens) and the prompt
+    # already pins the answer to one word. top_logprobs caps at 5 on OpenAI.
     kwargs = {"logprobs": True, "top_logprobs": 5} if request_logprobs else {}
     response = generate(messages, **kwargs)
     text = response.content or ""
