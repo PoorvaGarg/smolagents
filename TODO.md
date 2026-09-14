@@ -1,21 +1,83 @@
 # TODO
 
 Working list for the `agents_as_prob_progs` branch. Ask me to "check the TODO" and I'll read
-this back and update it. Last updated 2026-09-09.
+this back and update it. Last updated 2026-09-12.
+
+Commit `484598a` ("Finalizing experimental results for further analysis") landed; working tree
+clean at that point. Full test suite: 1113 passed, 66 skipped, 2 failed -- both confirmed
+pre-existing/environmental (the documented `MockChoice.index` baseline failure, and
+`test_import_smolagents_without_extras` shelling out to a `uv` binary not installed on this
+machine; reproduced identically by stashing to HEAD before this session's commit).
 
 ## Runs in flight
 
-As of 2026-09-09 15:25. Everything from the 2026-09-07/08 sweeps has finished except one:
+As of 2026-09-12, ~09:40 into these three. All from `launch_random_control.py` (see below),
+detached with `start_new_session`:
 
-| run | dir | state |
-|---|---|---|
-| n=1 Qwen3.5-9B, filter ON | `tracelet_direct_n1_tp_v7_react_Qwen/Qwen3.5-9B` | 104/165, 4 errors, pid 69204 alive, writing every few minutes |
+| run | dir | pid | state |
+|---|---|---|---|
+| n=5 random-select, gpt-4o | `tracelet_direct_n5_tp_rand5_react_gpt-4o` | 79740 | alive, 0/165 (heavier per-question, first pkl not landed yet) |
+| n=5 random-select, gpt-5.4-mini | `tracelet_direct_n5_tp_rand5_react_gpt-5.4-mini` | 79741 | alive, 7/165 |
+| n=5 random-select, Qwen3.5-9B | `tracelet_direct_n5_tp_rand5_react_Qwen/Qwen3.5-9B` | 79742 | alive, 0/165 (first pkl not landed yet) |
 
-Everything else — naive/n=1/n=3/n=5 filter-on baselines for all four models, goal-pruning for all
-four models — is at 165/165. Residual error counts, all small and not yet cleaned up: naive
-Qwen3.7-Plus 3, n=1 Qwen3.7-Plus 1, n=3 Qwen3.7-Plus 1, n=5 Qwen3.5-9B 1, goal-pruning Qwen3.7-Plus
-5. Likely the model's known reproducible content-filter 400s rather than transient bursts — check
-before quarantine-and-relaunching them.
+Logs in `scratchpad/random_control/`. Everything else — naive/n=1/n=3/n=5 filter-on baselines for
+all four models, goal-pruning for all four models, n=1 Qwen3.5-9B — is complete at 165/165.
+Residual, not-yet-cleaned-up error counts on old runs: naive Qwen3.7-Plus 3, n=1 Qwen3.7-Plus 1,
+n=3 Qwen3.7-Plus 1, n=5 Qwen3.5-9B 1, goal-pruning Qwen3.7-Plus 5 — likely the model's known
+reproducible content-filter 400s rather than transient bursts; check before quarantining.
+
+## Random-selection control at n=5 (launched 2026-09-12)
+
+This is experiment 1 from the backlog below, finally run — decisive test of whether the judge
+beats chance. `judge_strategy="random"` added to `TraceletCodeAgent` (`tracelet_agent.py`): no
+judge call at all, uniform pick among viable candidates, `TokenUsage(0, 0)`. Verified standalone
+(2000 draws, uniform distribution) and against all 77 existing tracelet tests before running a
+live 2-question smoke test (correct `judge_kind="random"`, uniform scores, zero notebook errors)
+prior to launching the full sweeps. `traceletReAct.ipynb` now exposes `SMOLAGENTS_JUDGE_STRATEGY`
+(default `"scores"`, so every existing sweep's behaviour is unchanged).
+
+Directly comparable to the existing `tracelet_direct_n5_tp_v6n5_react_<model>` judge-selection
+sweeps (same model, same n, same prompt/filter/max-steps -- only `RUN_TAG` differs, `_rand5` vs
+`_v6n5`, so they don't collide). **Qwen3.7-Plus excluded** — the provider hard-caps `n` at 4
+regardless of logprobs (`Range of n should be [1, 4]`), so it cannot run n=5 at all; user chose
+"3 models at true n=5" over the n=4 or skip-entirely alternatives.
+
+**When these finish**: pair each against its `_v6n5` counterpart (accuracy McNemar + token/step
+comparison). If random matches the judge within noise, the judge selection step is contributing
+nothing at n=5 — directly answering the open question below.
+
+## Judge-effectiveness diagnostic (measured 2026-09-12, offline, no new runs)
+
+Two ground-truthable checks over already-recorded candidate judge scores, across all four models'
+n=3/n=5 sweeps (4,867 judged steps with >=2 candidates):
+
+| metric | value |
+|---|---|
+| mean ESS/n (1.0 = judge shows no preference at all) | **0.90-0.94**, consistent across every model |
+| steps with ESS/n >= 0.95 (near-uniform, i.e. uninformative) | **74.3%** |
+| steps with real discrimination (ESS/n < 0.5) | 3.9% |
+| judge picked an **errored** candidate over a clean alternative | 26 times / 4,867 (0.53%) -- objectively wrong, no counterfactual needed |
+
+Quantifies what TODO already suspected qualitatively (flat scores except on rare clear-cut cases).
+This is diagnostic, not decisive -- it shows the judge often doesn't discriminate, not that doing
+so costs anything; that's exactly what the random-selection control above is for.
+
+## Trajectory-viewing notebooks rebuilt (2026-09-12)
+
+- `baseline/traceletReAct_trajectory.ipynb` — was 11 cells (a live-agent path plus a saved-sweep
+  path bolted on); rebuilt to **4 cells**: intro, renderer, config+loader, ranking. Drops the
+  entire live-agent path (model/tools/agent/dataset setup, running one live question) -- this
+  notebook now only reads completed sweep pickles, no API calls, no keys needed. The loader's
+  `RUNS` dict covers all 11 completed (model, arm) combinations, not just the three n=5 sweeps it
+  originally shipped with, and flags which arms carry residual errors. Restart the kernel before
+  using it (autoreload doesn't survive the cell-numbering/state change cleanly).
+- `baseline/goalPruningTrajectory.ipynb` — replays a goal-pruning run's buffer offline (no model
+  calls) showing exactly what was committed/open/dropped at each step; used to diagnose the q0
+  arXiv-ID-loss bug below.
+- `baseline/logprob_nondeterminism.ipynb` — demonstrates identical fill-in text getting different
+  logprobs within one `n>1` request; established cause is lack of batch invariance in serving
+  kernels (confirmed to reproduce on local vLLM too, not an API-only artefact), not the MoE-routing
+  guess floated earlier in this file's history.
 
 **Qwen3.7-Plus n=5 is impossible** — verified live 2026-09-07, not just from notes:
 
@@ -114,9 +176,9 @@ Accuracy differences remain within noise on both models.
 
 ## Experiments worth running, highest value first
 
-1. **Random-selection control at n=3.** Replace judge selection with a random pick among viable
-   candidates. n=1 vs n=3 was p≈0.87 with ~20% of answers flipping symmetrically, so if random
-   matches the judge, the judge contributes nothing. One-line change, one fewer LLM call per step.
+1. **Random-selection control.** ~~At n=3~~ — **launched at n=5 2026-09-12**, see the section
+   above; results pending. n=1 vs n=3 was p≈0.87 with ~20% of answers flipping symmetrically, so
+   if random matches the judge, the judge contributes nothing.
 2. **Trajectory-level marginalisation + a verifier.** Oracle union over two n=3 draws is
    **+12.5pp** (gpt-4o 27.5%→40.0%) and **+11.2pp** (mini 36.1%→47.3%). That is the measured
    headroom; the open question is whether a verifier can capture a third of it.
