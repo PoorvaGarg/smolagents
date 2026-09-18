@@ -16,6 +16,7 @@
 # limitations under the License.
 import ast
 import base64
+import copy
 import importlib.util
 import inspect
 import json
@@ -35,6 +36,7 @@ import jinja2
 
 
 if TYPE_CHECKING:
+    from smolagents.local_python_executor import PythonExecutor
     from smolagents.memory import AgentLogger
 
 
@@ -276,6 +278,67 @@ def truncate_content(content: str, max_length: int = MAX_LENGTH_TRUNCATE_CONTENT
             + f"\n..._This content has been truncated to stay below {max_length} characters_...\n"
             + content[-max_length // 2 :]
         )
+
+
+def safe_deepcopy(value: Any) -> Any:
+    """Deepcopy value, falling back to the original reference if it cannot be copied
+    (e.g. modules, C extensions)."""
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
+def find_stateful_backends(tools: dict[str, Any]) -> dict[int, Any]:
+    """Tools, or objects they hold, that opt into snapshotting via supports_state_snapshot plus
+    a get_state/set_state pair. Deduped by identity, since several tools share one backend (e.g.
+    all browser tools share a SimpleTextBrowser). Shared by any agent that needs to branch a
+    trajectory and later restore/resume a specific branch's tool state (TraceletCodeAgent,
+    BeamSearchCodeAgent)."""
+    found: dict[int, Any] = {}
+    for tool in tools.values():
+        for obj in (tool, *vars(tool).values()):
+            if (
+                getattr(obj, "supports_state_snapshot", False) is True
+                and callable(getattr(obj, "get_state", None))
+                and callable(getattr(obj, "set_state", None))
+            ):
+                found[id(obj)] = obj
+    return found
+
+
+def execute_against_snapshot(
+    python_executor: "PythonExecutor",
+    tools: dict[str, Any],
+    code: str,
+    executor_state: dict[str, Any],
+    tool_state: dict[int, Any],
+) -> tuple[str, Any, bool, str | None, dict[str, Any], dict[int, Any]]:
+    """Install (executor_state, tool_state) into python_executor and the tools' stateful
+    backends, execute code, and return (observation, output, is_final_answer, error,
+    post_executor_state, post_tool_state) -- the state resulting from this one execution.
+
+    Does not restore whatever state python_executor held before this call; a caller running
+    several of these in a row (several candidates from one base, or several different beams)
+    decides for itself when, if ever, that needs restoring. On error, the returned "post" state
+    is just the state this call was given, unchanged, since a failed execution produced no new
+    state worth capturing.
+    """
+    backends = find_stateful_backends(tools)
+    python_executor.state.clear()
+    python_executor.state.update({k: safe_deepcopy(v) for k, v in executor_state.items()})
+    for key, obj in backends.items():
+        if key in tool_state:
+            obj.set_state(tool_state[key])
+    try:
+        code_output = python_executor(code)
+        observation = "Execution logs:\n" + code_output.logs
+        observation += "\nLast output from code snippet:\n" + truncate_content(str(code_output.output))
+        post_executor_state = {k: safe_deepcopy(v) for k, v in python_executor.state.items()}
+        post_tool_state = {key: obj.get_state() for key, obj in backends.items()}
+        return observation, code_output.output, code_output.is_final_answer, None, post_executor_state, post_tool_state
+    except Exception as e:
+        return f"Error: {e}", None, False, str(e), executor_state, tool_state
 
 
 class ImportFinder(ast.NodeVisitor):

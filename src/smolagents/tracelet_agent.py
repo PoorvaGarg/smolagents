@@ -1,5 +1,4 @@
 import ast
-import copy
 import math
 import random
 import re
@@ -7,11 +6,20 @@ from dataclasses import dataclass
 from typing import Any, Generator, Literal
 
 from .agents import ActionOutput, CodeAgent, ToolCall
+from .context_pruning.completion_judge import judge_step_achieved_expectation
 from .local_python_executor import fix_final_answer_code
 from .memory import ActionStep
 from .models import ChatMessage, MessageRole, agglomerate_stream_deltas, agglomerate_stream_deltas_by_index
 from .monitoring import LogLevel, TokenUsage
-from .utils import AgentExecutionError, AgentParsingError, parse_code_blobs, truncate_content
+from .utils import (
+    AgentExecutionError,
+    AgentParsingError,
+    execute_against_snapshot,
+    find_stateful_backends,
+    parse_code_blobs,
+    safe_deepcopy,
+    truncate_content,
+)
 
 
 # Prefix identifying a sentinel a code skeleton uses in place of a tool-call argument
@@ -53,15 +61,6 @@ _SENTINEL_INSTRUCTION = (
     # "control flow, and which tool you call. Only replace arguments passed directly to "
     # "tool calls; do not sentinel arguments to other functions (e.g. print, len)."
 )
-
-
-def _safe_deepcopy(value: Any) -> Any:
-    """Deepcopy value, falling back to the original reference if it cannot be copied
-    (e.g. modules, C extensions). Same pattern as probabilistic_agent.py."""
-    try:
-        return copy.deepcopy(value)
-    except Exception:
-        return value
 
 
 # Argument shapes worth sampling: an actual value, rather than a reference to one.
@@ -295,7 +294,7 @@ class TraceletCodeAgent(CodeAgent):
         *args,
         n_samples: int = 3,
         skeleton_strategy: Literal["post_process", "direct_prompt"] = "post_process",
-        judge_strategy: Literal["scores", "score_probs", "token_probs", "random"] = "scores",
+        judge_strategy: Literal["scores", "score_probs", "token_probs", "expectation", "random"] = "scores",
         request_logprobs: bool = True,
         **kwargs,
     ):
@@ -404,7 +403,8 @@ class TraceletCodeAgent(CodeAgent):
             total_output += judge_usage.output_tokens
 
             memory_step.candidates = self._record_candidates(
-                trials, [lp for _, _, lp in viable], judge_scores, winner_index
+                trials, [lp for _, _, lp in viable], judge_scores, winner_index,
+                fillins=[f for _, f, _ in viable],
             )
 
             winning_code, winning_fillin, _ = viable[winner_index]
@@ -575,15 +575,19 @@ class TraceletCodeAgent(CodeAgent):
         logprobs: list[_FillinLogprob | None],
         judge_scores: list[float],
         winner_index: int,
+        fillins: list[dict[str, str]] | None = None,
     ) -> list[dict[str, Any]]:
         """One picklable record per candidate, so a trajectory can be replayed after the run."""
         probs = _softmax([lp.mean if lp else float("-inf") for lp in logprobs])
+        fillins = fillins or [{}] * len(trials)
         return [
             {
                 "code": t.code,
                 # Bounded: a full page of observation per candidate per step would dwarf the pickle.
                 "observation": truncate_content(t.observation or "", 2000),
                 "error": t.error,
+                # The raw sentinel -> value assignment this candidate sampled, before substitution.
+                "fillin": fillin,
                 "fillin_logprob": lp.logprob if lp else None,
                 "fillin_n_tokens": lp.n_tokens if lp else None,
                 "fillin_mean_logprob": lp.mean if lp else None,
@@ -595,7 +599,7 @@ class TraceletCodeAgent(CodeAgent):
                 "won": i == winner_index,
                 "is_final_answer": t.is_final_answer,
             }
-            for i, (t, lp, p) in enumerate(zip(trials, logprobs, probs))
+            for i, (t, lp, p, fillin) in enumerate(zip(trials, logprobs, probs, fillins))
         ]
 
     def _substitute(self, code_skeleton: str, fillin: dict[str, str]) -> str:
@@ -609,52 +613,30 @@ class TraceletCodeAgent(CodeAgent):
 
     def _stateful_backends(self) -> dict[int, Any]:
         """Tools, or objects they hold, that opt into snapshotting via supports_state_snapshot plus a
-        get_state/set_state pair. Deduped by identity, since several tools share one backend (e.g.
-        all browser tools share a SimpleTextBrowser)."""
-        found: dict[int, Any] = {}
-        for tool in self.tools.values():
-            for obj in (tool, *vars(tool).values()):
-                if (
-                    getattr(obj, "supports_state_snapshot", False) is True
-                    and callable(getattr(obj, "get_state", None))
-                    and callable(getattr(obj, "set_state", None))
-                ):
-                    found[id(obj)] = obj
-        return found
+        get_state/set_state pair. See find_stateful_backends in utils.py -- shared with
+        BeamSearchCodeAgent, which needs the exact same lookup for its own branching."""
+        return find_stateful_backends(self.tools)
 
     def _execute_candidates(self, candidates: list[str]) -> list[_Trial]:
         """Trial-execute each candidate against a snapshot/restore of executor state and of any
         stateful tool backend (side effects are still real -- e.g. a web search per candidate).
         Each _Trial captures the post-execution state so committing the winner needs no second
-        execution; live executor and backend state are restored on return."""
-        snapshot = {k: _safe_deepcopy(v) for k, v in self.python_executor.state.items()}
+        execution; live executor and backend state are restored on return. Every candidate
+        starts from the same snapshot, not from where the previous one left off -- see
+        execute_against_snapshot in utils.py, shared with BeamSearchCodeAgent."""
+        snapshot = {k: safe_deepcopy(v) for k, v in self.python_executor.state.items()}
         backends = self._stateful_backends()
         backend_snapshot = {key: obj.get_state() for key, obj in backends.items()}
         trials = []
         try:
             for code in candidates:
-                self.python_executor.state.clear()
-                self.python_executor.state.update({k: _safe_deepcopy(v) for k, v in snapshot.items()})
-                # Every candidate starts from the same page, not from where the previous one left off.
-                for key, obj in backends.items():
-                    obj.set_state(backend_snapshot[key])
-                try:
-                    code_output = self.python_executor(code)
-                    observation = "Execution logs:\n" + code_output.logs
-                    observation += "\nLast output from code snippet:\n" + truncate_content(str(code_output.output))
-                    post_state = {k: _safe_deepcopy(v) for k, v in self.python_executor.state.items()}
-                    trials.append(
-                        _Trial(
-                            code,
-                            observation,
-                            post_state,
-                            code_output.output,
-                            code_output.is_final_answer,
-                            post_tool_state={key: obj.get_state() for key, obj in backends.items()},
-                        )
-                    )
-                except Exception as e:
-                    trials.append(_Trial(code, f"Error: {e}", error=str(e)))
+                observation, output, is_final, error, post_state, post_tool_state = execute_against_snapshot(
+                    self.python_executor, self.tools, code, snapshot, backend_snapshot
+                )
+                if error is None:
+                    trials.append(_Trial(code, observation, post_state, output, is_final, post_tool_state=post_tool_state))
+                else:
+                    trials.append(_Trial(code, observation, error=error))
         finally:
             self.python_executor.state.clear()
             self.python_executor.state.update(snapshot)
@@ -721,6 +703,29 @@ class TraceletCodeAgent(CodeAgent):
                 likelihoods = [1.0 if i == int(match.group(0)) else 0.0 for i in range(len(trials))]
         return likelihoods, response.token_usage
 
+    def _judge_expectation(self, thought: str, trials: list[_Trial]) -> tuple[int, list[float], TokenUsage]:
+        """One judge call per candidate: does its observation achieve what the thought expected?
+        Measured (TODO.md, 2026-09-14) to discriminate real candidates ~5x more often than the
+        default "scores" judge (ESS/n real-discrimination rate 20% vs 3.9%, 0 objective failures
+        in a 30-step sample) and to correlate 0.528 with eventual trajectory correctness."""
+        p_yes_list = []
+        total_input = total_output = 0
+        for t in trials:
+            p_yes, _, usage = judge_step_achieved_expectation(self._generate, thought, t.code, t.observation or "")
+            p_yes_list.append(p_yes if p_yes is not None else 0.0)
+            if usage:
+                total_input += usage.input_tokens
+                total_output += usage.output_tokens
+        probs = _normalize_scores(p_yes_list)
+        winner_index = max(range(len(trials)), key=lambda i: probs[i])
+        self.logger.log(
+            f"[Tracelet] expectation judge P(yes): {[round(p, 3) for p in p_yes_list]} -> probs: "
+            + ", ".join(f"c{i}={p:.3f}" for i, p in enumerate(probs))
+            + f" -- picked candidate {winner_index}.",
+            level=LogLevel.INFO,
+        )
+        return winner_index, probs, TokenUsage(input_tokens=total_input, output_tokens=total_output)
+
     def _pick_best(self, judge_output: str, n: int) -> int:
         """Aggregate: parse the judge's per-candidate scores and return the index of the
         highest-scoring one. Ties, and total parse failure (all scores default to 0.0),
@@ -735,7 +740,10 @@ class TraceletCodeAgent(CodeAgent):
         same single call with those scores normalised into a distribution -- no extra tokens.
         "token_probs" instead asks for one number and reads the token distribution over candidate
         indices; it costs the same but comes out near one-hot, so it carries no uncertainty.
-        "random" is the control: no judge call at all, uniform pick among viable candidates."""
+        "expectation" asks, per candidate, whether its observation achieved what the thought
+        expected (one call per candidate, not one call for all of them) -- the most discriminating
+        strategy measured so far, see TODO.md. "random" is the control: no judge call at all,
+        uniform pick among viable candidates."""
         if self.judge_strategy == "random":
             winner_index = random.randrange(len(trials))
             uniform = [1.0 / len(trials)] * len(trials)
@@ -744,6 +752,8 @@ class TraceletCodeAgent(CodeAgent):
                 level=LogLevel.INFO,
             )
             return winner_index, uniform, TokenUsage(input_tokens=0, output_tokens=0)
+        if self.judge_strategy == "expectation":
+            return self._judge_expectation(thought, trials)
         if self.judge_strategy == "token_probs":
             likelihoods, token_usage = self._judge_distribution(thought, trials)
             if likelihoods is not None:

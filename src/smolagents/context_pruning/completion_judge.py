@@ -71,6 +71,48 @@ def _answer_from_text(text: str | None) -> float | None:
     return None
 
 
+_THOUGHT_EXPECTATION_PROMPT = """A single step of an agent's trajectory is shown below.
+
+Thought: {thought}
+
+Code:
+{code}
+
+Observation:
+{observation}
+
+Does the output of this step achieve what the model expected in the thought? Reply with exactly one word: yes or no."""
+
+
+def judge_step_achieved_expectation(
+    generate: Any,
+    thought: str,
+    code: str,
+    observation: str,
+    request_logprobs: bool = True,
+) -> tuple[float | None, str, TokenUsage | None]:
+    """Probability that this step's observation achieved what its own thought expected.
+
+    Unlike judge_completion, which needs a separately-elicited `Expectation:` statement, this
+    reads the expectation directly out of the free-form thought -- works for any CodeAgent
+    trajectory, not just one using GoalPruningCodeAgent's structured protocol. Same
+    (probability, raw answer text, token usage) contract as judge_completion.
+    """
+    instruction = _THOUGHT_EXPECTATION_PROMPT.format(
+        thought=(thought or "").strip() or "(none)",
+        code=(code or "").strip() or "(none)",
+        observation=truncate_content((observation or "").strip() or "(empty)", OBSERVATION_LIMIT),
+    )
+    messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": instruction}])]
+    kwargs = {"logprobs": True, "top_logprobs": 5} if request_logprobs else {}
+    response = generate(messages, **kwargs)
+    text = response.content or ""
+    probability = _answer_probability(response)
+    if probability is None:
+        probability = _answer_from_text(text)
+    return probability, text.strip(), response.token_usage
+
+
 def judge_completion(
     generate: Any,
     thought: str,

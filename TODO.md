@@ -1,7 +1,286 @@
 # TODO
 
 Working list for the `agents_as_prob_progs` branch. Ask me to "check the TODO" and I'll read
-this back and update it. Last updated 2026-09-12.
+this back and update it. Last updated 2026-09-15.
+
+## RESUME HERE: 3 of 4 full beam-search sweeps running/done, DSL compiler built, empty-code root cause found (fix deferred) (2026-09-17)
+
+**Sweep status** (all via `baseline/run_beam_search_sweep.py`, `beam_width=2, branch_factor=2,
+max_steps=20`, resumable -- rerun the same command to continue from cached pickles):
+- **gpt-4o: DONE, 165/165, 49/165 = 29.7% correct.**
+- gpt-5.4-mini: running, pid 3335, resumed at 131/165 (log:
+  `baseline/beamsearch_bw2_bf2_react_gpt-5.4-mini_launch.log`).
+- Qwen/Qwen3.5-9B: running, pid 3336, resumed at 50/165 (log:
+  `baseline/beamsearch_bw2_bf2_react_Qwen_Qwen3.5-9B_launch.log`; note the `run_name` for this
+  one literally contains a `/`, matching existing repo convention -- pickles are under
+  `baseline/beamsearch_bw2_bf2_react_Qwen/Qwen3.5-9B/`, trees under
+  `.../Qwen3.5-9B_trees/`).
+- **Qwen/Qwen3.7-Plus: blocked, not running.** Together API rejects it with
+  `third_party_data_sharing_blocked` ("This model requires third-party data sharing to be
+  enabled for your organization") -- an account-level Together dashboard setting, not fixable in
+  code. Earlier tracelet/naive runs in this repo used this model fine, so this is a newer
+  restriction. Needs the user to enable it in their Together account, or skip this model.
+- All three OpenAI/Together-routing goes through `models = {...}` + provider branch in
+  `run_beam_search_sweep.py`'s `main()` -- **this branching was missing in the first version** of
+  that script (it always called OpenAI's API regardless of `SMOLAGENTS_MODEL`), which silently
+  produced 165/165 "invalid model ID" failures for both Qwen models on the first launch attempt;
+  fixed, verified with a live single-question test for both Qwen models before relaunching.
+
+**naiveReAct gpt-5.4-mini comparison run: DONE.** `naive_react_gpt-5.4-mini_False_rerun_emptycode`
+(165/165, fresh run launched specifically to check reproducibility): 33.9% accuracy, 33.4% empty
+code (319/954 steps) -- closely matches the pre-existing `_fixedbrowser` run (32.1%, 27.6%),
+confirming ~28-33% empty-code is a stable gpt-5.4-mini/naiveReAct characteristic, not a fluke.
+
+**Key finding -- BeamSearchCodeAgent makes gpt-5.4-mini's empty-code problem much worse, and the
+mechanism is now confirmed, not just hypothesized.** Across the first 16 questions of the
+gpt-5.4-mini beam-search sweep: **90.4% of candidates (756/836) had empty code**, accuracy only
+1/16 = 6.25% (naiveReAct on the same model: ~30% empty code, ~33% accuracy -- both roughly 3x
+worse under beam search). Root cause, verified against real data
+(`beamsearch_bw2_bf2_react_gpt-5.4-mini/0.pkl`, step 0 codeless -> step 1's
+`model_input_messages` is exactly `[SYSTEM, USER(task), ASSISTANT(bare codeless text)]`, nothing
+after):
+- `_expand_beam`'s codeless branch (`beam_search_agent.py`, the `else:` when
+  `step.code_action is None`) never sets `step.observations` or `step.error`.
+- `ActionStep.to_messages()` (`memory.py`) only appends an `Observation:` message
+  `if self.observations is not None`, and an `Error:` message `if self.error is not None`. With
+  both `None`, a codeless step contributes *only* the bare assistant text to history.
+- Consequence: the message list built for the *next* round's `_sample_step` call ends on a
+  dangling `ASSISTANT` turn with no `USER`/`TOOL_RESPONSE` in between -- a malformed multi-turn
+  structure. naiveReAct never has this gap: a parse failure sets `step.error`, which
+  `to_messages()` turns into an explicit `Error:...Now let's retry...` `TOOL_RESPONSE`, guaranteeing
+  a fresh turn always follows every assistant turn. This gap compounds every round sampled from
+  an affected beam's history, matching the 42.7% "both thought and code empty" rate seen deeper in
+  gpt-5.4-mini's trajectories.
+- **A fix was proposed** (set `step.observations` to a neutral, non-scolding string like
+  `"Execution logs:\n(no code block was provided in this step)"` in that `else:` branch, so
+  `to_messages()` always emits *something* -- keeping the score-only survival rule from decision 7
+  completely untouched, just fixing the conversational structure) **but the user explicitly
+  declined to apply it now** ("why do we need a fix, just restart the process") when asked to
+  confirm before implementing. **Do not apply this fix without being asked again** -- the
+  currently-running gpt-5.4-mini/Qwen3.5-9B sweeps are running WITHOUT it, by explicit choice.
+
+**Pending accuracy comparison (asked for, not yet done on the full set)**: on a 71-question
+matched subset, gpt-4o beam search beat naive gpt-4o (`_var1/2/3`, filter-on, mean 25.1%) by
+~3-10pp (32.4% vs 22.5-29.6%). Now that gpt-4o's full sweep is done (165/165, 29.7%), **redo this
+comparison against the full 165-question naive baselines** (still `_var1/2/3`, NOT the
+filter-off `_fixedbrowser` run -- see CLAUDE.md's leak-filter warning) -- not done yet. Repeat for
+gpt-5.4-mini and Qwen3.5-9B once their sweeps finish.
+
+**Probabilistic-program notation, settled by hand then implemented and verified** (this is the
+answer to the user's earlier step 4 "write a translation from trajectories to probabilistic
+programs" -- superseding the original tracelet-oriented `Choice/Evidence/Prune/Trace` schema
+sketch further down this file, which was designed before beam search existed):
+```
+theta_<parent> = exp(thought_logprob_i) / sum(exp(thought_logprob_j) for j in remaining siblings)
+thought<beam_id_i> = flip(theta_<parent>)              # first candidate
+thought<beam_id_j> = (not thought_i) and flip(theta')  # subsequent candidates, stick-breaking
+thought<beam_id_last> = not (all previous)              # last candidate forced, no flip needed
+
+code<beam_id> = if thought<beam_id> then <the actual code text> else Error   # Error also covers
+                                                                              # genuine no-code-generated candidates
+obs<beam_id> = execute(code<beam_id>)
+factor(log judge(thought, code, obs))                   # log(max(p_yes, 1e-4))
+
+{pool} = resample_top_k({pool}, k=beam_width)  # pool = this round's new children PLUS any
+                                                # already-final beam carried forward unexpanded
+```
+Settled decisions along the way: `theta` normalizes only over `thought_logprob` (code was
+explicitly decided to carry no probability of its own -- "eliminate probability associated with
+code"); `flip`s are a proper stick-breaking sequence for `branch_factor > 2`, not independent
+per-candidate flips (verified: two independent flips could both come out true/false, which breaks
+"exactly one realized" -- caught by the user reviewing round 1 by hand).
+
+**Implementation, in `baseline/compile_trace_to_program.py`** (built one function at a time, each
+verified against real Q0 data before moving on): `theta(children)` (stick-breaking sequence, any
+N), `render_branch_point(parent_id, children)`, `render_round(round_data, prev_kept)` (handles the
+carried-forward-frozen-final case), `find_winner(rounds)` (replicates `run()`'s own winner rule),
+`compile_trace(rounds, question, true_answer, prediction)`, plus a CLI (`main()`). Verified
+byte-for-byte consistent with the hand-derived Q0 program (8 rounds, winner
+`0.0.1.0.0.0.0.1.1`, answer `"egalitarian or hierarchical"`). Run it (must use the venv's
+Python, and from inside `baseline/` since paths are relative):
+```
+cd baseline && /Users/poorvag/Work/smolagents/.venv/bin/python compile_trace_to_program.py <run_name> <index>
+```
+e.g. `compile_trace_to_program.py beamsearch_bw2_bf2_react_gpt-4o 0`.
+
+**`baseline/beamSearchReAct_single.ipynb` improvements** (answers the user's step 1 "improve
+looking at trajectories"): cell 8 now renders an actual box-drawing tree (ancestry via `beam_id`,
+not a flat round list), tagging `★ WINNER` / `FINAL` / `ERRORED` / `CUT (pruned)` /
+`UNFINISHED (search ended)` per node, plus `p_yes`/`thought_lp`/`code_lp`/`pruning_score`. Cell 6
+supports `LOAD_FROM_FILE` (old single-file dry-run JSONs) or `LOAD_FROM_SWEEP = (run_name, index)`
+(loads a sweep's `.pkl` + tree `.json` pair directly, no API cost) instead of re-running the
+agent. Cell 9 (new, last) calls `compile_trace` on whatever's currently loaded. The old
+"save trajectory to JSON" cell was dropped during the `LOAD_FROM_SWEEP` refactor and confirmed
+by the user as not needed -- do not re-add it.
+
+**Failure-case findings from before the full sweep, still valid** (see the untouched
+"premature convergence" section immediately below this one for full detail on Q2/Q4/Q6): a
+confidently-wrong finished beam beats a still-correctly-working unfinished one because the judge's
+"did this achieve the thought's expectation" question is nearly tautological for a `final_answer`
+step (the model said it would answer, then did -- of course that "succeeds"). This is a distinct
+issue from the gpt-5.4-mini empty-code/message-gap finding above; neither has been fixed yet, both
+are documented, and no design change should be made to either without the user asking first.
+
+**Exact next steps when resuming**:
+1. Check on gpt-5.4-mini (pid 3335) and Qwen3.5-9B (pid 3336) sweep progress; they were at
+   131/165 and 50/165 respectively as of 2026-09-17.
+2. Once each finishes, compute its empty-code rate (gpt-5.4-mini in particular) and accuracy, and
+   the matched-baseline naive comparison, the same way it was done for gpt-4o.
+3. Redo the gpt-4o vs naive full-165 accuracy comparison (currently only done on a 71-question
+   subset).
+4. Qwen3.7-Plus stays blocked until the user enables third-party data sharing on Together, or
+   they say to skip it permanently.
+5. The codeless-step message-gap fix and the premature-convergence/judge-circularity issue both
+   remain proposed-but-not-applied by explicit user choice -- revisit only if asked.
+
+---
+
+**State**: `BeamSearchCodeAgent` is implemented, unit-tested, and smoke-tested (gpt-4o and
+Qwen3.5-9B both got Q112 right, 3 rounds, via `baseline/beamSearchReAct_single.ipynb`). Dry run
+extended to 15 GAIA questions total (gpt-4o, `beam_width=2, branch_factor=2, max_steps=20`):
+**5/15 correct** (Q0, Q1, Q5, Q13, Q14 right; Q2, Q3, Q4, Q6, Q7, Q8, Q9, Q10, Q11, Q12 wrong).
+Scripts: `beam_5q_dryrun.py` (Q0-Q4) and `beam_10q_dryrun.py` (Q5-Q14), both in
+`/private/tmp/claude-502/-Users-poorvag-Work-smolagents/2a2cc3b2-ba33-45f3-9f0d-3e21f682d237/scratchpad/`
+(a session-scoped scratchpad -- may not survive indefinitely; the per-question JSON trees it
+wrote under `baseline/beam_dryrun_q*.json` and `beam_dryrun_summary*.json` are the durable
+record, though those are gitignored `*.json` so they only exist on this machine). Full round-by
+-round beam trees per question are in those JSON files if deeper re-inspection is needed later.
+
+**Key finding -- premature convergence, now with 15-question support**: a "premature
+convergence" heuristic (did the last round keep a finished beam while cutting an unfinished
+sibling, on a question that came out wrong) fired on **4 of the 10 wrong answers in the second
+batch** (Q6, Q7, Q11, Q12), on top of the two clear qualitative examples from the first batch
+(Q2, Q4 -- see below). That's a real, recurring pattern, not a one-off:
+- Q4 (Kipchoge/Moon, true `17`): two branches reached `final_answer("17000")` (off-by-1000-unit
+  slip) with high judge confidence (p_yes 0.97, 0.79) and won pruning, while two siblings had
+  *just computed the correct value* (`17`) that same round but hadn't called `final_answer` yet
+  -- their lower pruning_score (not-yet-final beams score lower almost by construction) got them
+  cut before they could finish.
+- Q2 (Nature p-values): a branch verifying the real article count on Nature's site got pruned in
+  favor of two branches that guessed an unverified number and finished confidently (wrong).
+- Q9, Q10 hit `max_steps=20` without any beam ever finishing, so `run()`'s fallback
+  (`max(beams, key=pruning_score)` among the unfinished) kicked in -- Q9 returned a raw scraped
+  webpage as the "answer", Q10 returned `None`. Working as designed (per the earlier decision:
+  "just return the best beam's last action_output"), but a visible symptom of the same underlying
+  issue: many candidates never converge cleanly, and codeless/thin candidates crowd the pool
+  (Q9: 35/78 candidates had no code at all; Q10: 44/78; Q13 -- one of the *correct* ones --
+  still had 33/46).
+- **Conclusion**: the per-step "did this achieve the thought's expectation" judge tends to reward
+  *reaching* `final_answer` over *being right*, so a confidently-wrong finished beam beats a
+  still-correctly-working unfinished one. This is now empirically supported across 15 questions,
+  not just anecdotal -- **worth addressing before a full sweep**, per the user's own ordering
+  (next step 3 below is "run a whole sweep," explicitly listed after understanding this).
+
+Also generic, not new: codeless candidates (model replies in prose, no `<code>` block) are common
+across all models tested, not just gpt-5.4-mini's earlier degenerate case -- rates ranged from
+0/6 to 44/78 per question across all 15. Per the user's explicit
+design call, these are NOT treated as errored; they go to the judge and their score alone decides
+survival (see decision 7's sibling note in `beam_search_agent.py`'s `_sample_step`/`_expand_beam`).
+
+**User's 4 next steps, in the order given (2026-09-15), none started yet**:
+1. Improve looking at the trajectories in the Jupyter notebook (`baseline/beamSearchReAct_single.ipynb` exists as a first cut -- round-by-round beam tree printout; "improve" likely means better formatting/navigation, not rebuilding from scratch, but ask rather than assume).
+2. Look at the failure cases for a few questions (Q2, Q3, Q4, Q6, Q7, Q8, Q9, Q10, Q11, Q12 are all wrong -- 10 candidates to pick from; Q2/Q4/Q9/Q10 above already have some analysis, the rest don't yet).
+3. Run a whole sweep (only after the dry-run pattern above is understood/resolved -- don't jump straight here).
+4. Write a translation from trajectories to probabilistic programs (this connects back to the session's earlier custom-DSL design discussion -- `Choice`/`Evidence`/`Prune`/`Trace` -- mentioned before beam search implementation began; no code for this exists yet).
+
+---
+
+## Previous state: beam search implementation -- code complete, live smoke test done (2026-09-15)
+
+`BeamSearchCodeAgent` (`src/smolagents/beam_search_agent.py`, untracked, not yet committed) is
+now fully implemented and unit-tested. Working style stays strictly incremental: one function at
+a time, explained before/while writing, confirmed before moving to the next -- keep that up for
+whatever comes next (the live smoke test, then the 5-question dry run).
+
+**Checkpoint verified**: full suite green -- 1126 passed, 66 skipped, 2 failed (both the same
+pre-existing baseline failures, unrelated to this work: `TestToolCallingAgent::test_toolcalling_
+agent_stream_logs_multiple_tool_calls_observations` and `test_import_smolagents_without_extras`).
+10 new tests in `tests/test_beam_search_agent.py`, all passing.
+
+**What's in `beam_search_agent.py`**:
+- `_sum_scored_logprobs` / `_split_token_logprobs`: split one completion's per-token logprobs into
+  a "thought" half and a "code" half at the opening code-block tag (everything before is thought,
+  the tag onward is code). Reuses `PLACEHOLDER_LOGPROB`/`_FillinLogprob` from `tracelet_agent.py`.
+- `Beam` dataclass: `beam_id`/`parent_id` (lineage), `memory` (this beam's own `AgentMemory`,
+  never `self.memory`), `executor_state`/`tool_state` (this beam's own snapshot),
+  `expectation_scores`/`thought_logprobs`/`code_logprobs` (per-step, running), `errored_this_step`,
+  `is_final`/`final_output`. `extend()` builds a child without mutating the parent.
+  - `score` = mean(expectation_scores) -- judge-only, kept purely as a diagnostic/reporting value.
+  - `pruning_score` = mean over steps of `log(p_yes) + thought_logprob + code_logprob` (log(p_yes)
+    floored at `log(1e-4)` so a zero judge score doesn't send it to -inf) -- **this is what
+    actually drives both pruning and winner selection now** (see decision 7 below).
+- `BeamSearchCodeAgent(CodeAgent)`: `beam_width`/`branch_factor` params.
+  - `_build_root_beam(task, images)` -- fresh `AgentMemory` (system prompt + `TaskStep`), empty
+    executor/tool state, `beam_id="0"`.
+  - `_beam_messages(memory)` -- `write_memory_to_messages` against an explicit `memory` arg.
+  - `_sample_step(memory)` -- one independent full (thought, code) resample (no skeleton/fill-in
+    split); returns an unexecuted `ActionStep` plus the thought text and the two split logprobs.
+  - `_execute_step(step, executor_state, tool_state)` -- runs `execute_against_snapshot`, writes
+    `.observations`/`.action_output`/`.is_final_answer`/`.timing.end_time`/`.error` onto `step` in
+    place, returns `(post_executor_state, post_tool_state, errored: bool)`.
+  - `_judge_step(thought, step)` -- one `judge_step_achieved_expectation` call, returns
+    `(p_yes, token_usage)` (`p_yes` defaults to 0.0 if unparseable).
+  - `_expand_beam(beam)` -- `branch_factor` children off one live beam: sample, execute, judge,
+    fold judge token cost into the step's `token_usage`, `extend()`. Never called on `is_final`.
+  - `_prune(beams)` -- keep top `beam_width`, `key=lambda b: (not b.errored_this_step,
+    b.pruning_score)`.
+  - `_stateful_backends()` -- delegates to the shared `find_stateful_backends`.
+  - `run(task, reset=True, images=None, max_steps=None)` -- builds the root beam; loops (each
+    round: `is_final` beams pass through untouched, others `_expand_beam`; combine and `_prune`)
+    until every beam is `is_final` or `max_steps` hits; winner = highest-`pruning_score` finished
+    beam if any finished, else highest-`pruning_score` beam overall; copies the winner's steps
+    into `self.memory` (so `evaluate_agent`, which reads `agent.memory.steps` afterward, sees an
+    ordinary-looking trajectory) and returns `winner.final_output` or, if nothing ever finished,
+    the winning beam's last `action_output`.
+
+**Refactor done alongside** (to avoid duplicating logic between `TraceletCodeAgent` and
+`BeamSearchCodeAgent`, per explicit instruction not to duplicate code):
+- `src/smolagents/utils.py` gained three shared functions: `safe_deepcopy` (moved from
+  `tracelet_agent.py`'s `_safe_deepcopy`), `find_stateful_backends(tools)` (moved from
+  `tracelet_agent.py`'s `_stateful_backends` method body, now takes `tools` as a plain arg),
+  and `execute_against_snapshot(python_executor, tools, code, executor_state, tool_state)` (new
+  -- installs a given state, runs one code string, returns `(observation, output,
+  is_final_answer, error, post_executor_state, post_tool_state)`; does **not** restore prior
+  live state itself, that's the caller's job).
+- `tracelet_agent.py`: `_stateful_backends()` and `_execute_candidates()` both now delegate to
+  the shared functions instead of having their own copies; `_safe_deepcopy` and the now-unused
+  `import copy` were removed. All 80 tracelet tests still pass after this refactor.
+
+**Design decisions settled this session** (don't re-litigate, just implement):
+1. Errored candidate: still judged (never hard-zeroed to p=0.0), but ranks below every
+   non-errored candidate in pruning regardless of score -- lexicographic tier, not a score
+   penalty. Can still survive a prune if there aren't enough clean candidates to fill
+   `beam_width` -- "the trajectory can still recover."
+2. A beam that reaches `final_answer` freezes (carries its score forward unchanged, is not
+   branched further each round) but is **not** exempt from pruning -- it still competes on the
+   same `(errored, pruning_score)` key every round and can be cut before the search ends. Only at
+   the very end does "did it finish" gate before "how well did it score": any finished beam beats
+   any unfinished one regardless of score; ties among finished beams broken by `pruning_score`.
+   If nothing ever finishes by `max_steps`, fall back to `max(beams, key=pruning_score)` among the
+   unfinished ones.
+3. First real test: `beam_width=2`, `branch_factor=2`, `max_steps=20`, on 5 questions run live
+   and manually inspected -- before anything resembling a full 165-question sweep.
+4. `branch_factor` samples are independent re-calls to the model at its default temperature
+   (1.0) -- no forced diversity penalty, matches what was already validated (near-100%
+   uniqueness across independent full-step resamples, see the naiveReAct-vs-tracelet experiments
+   earlier in this file).
+5. Thought/code split point: everything before the opening code-block tag is thought, the tag
+   onward is code (settled explicitly, see `_split_token_logprobs`).
+6. ~~`thought_logprobs`/`code_logprobs` are tracked but not yet used for pruning~~ -- **superseded
+   by decision 7.**
+7. (2026-09-15) `thought_logprobs`/`code_logprobs` now ARE folded into pruning and winner
+   selection, via `Beam.pruning_score`: for each step, `log(p_yes) + thought_logprob +
+   code_logprob` -- the log joint `P(thought) * P(code | thought) * P(judge=yes | thought, code)`
+   by the chain rule (each term already conditioned on what came before it in the same step, not
+   an independence assumption). Combined per step, then averaged across steps (not summed), so
+   one bad step doesn't compound with the rest -- same reasoning as `score` averaging instead of
+   summing. `p_yes` is floored at `1e-4` before the log so a zero-information judge fallback
+   doesn't send the whole thing to -inf. `Beam.score` (judge-only mean) is kept as a separate,
+   unused-for-ranking diagnostic property.
+
+**Next step**: piece (e) from the original plan -- one live smoke test on a single GAIA question
+at `beam_width=2, branch_factor=2, max_steps=20`, then the agreed 5-question dry run (manually
+inspected), before anything resembling a full sweep.
 
 Commit `484598a` ("Finalizing experimental results for further analysis") landed; working tree
 clean at that point. Full test suite: 1113 passed, 66 skipped, 2 failed -- both confirmed
@@ -11,20 +290,46 @@ machine; reproduced identically by stashing to HEAD before this session's commit
 
 ## Runs in flight
 
-As of 2026-09-12, ~09:40 into these three. All from `launch_random_control.py` (see below),
-detached with `start_new_session`:
+**Launched 2026-09-14**: n=5 sweep of the new `judge_strategy="expectation"` (see the section
+below) for the three models that support n=5, via `scratchpad/launch_expectation_judge.py`
+(detached, `start_new_session`), `RUN_TAG="_exp5"`, logs in `scratchpad/expectation_judge/`:
 
-| run | dir | pid | state |
-|---|---|---|---|
-| n=5 random-select, gpt-4o | `tracelet_direct_n5_tp_rand5_react_gpt-4o` | 79740 | alive, 0/165 (heavier per-question, first pkl not landed yet) |
-| n=5 random-select, gpt-5.4-mini | `tracelet_direct_n5_tp_rand5_react_gpt-5.4-mini` | 79741 | alive, 7/165 |
-| n=5 random-select, Qwen3.5-9B | `tracelet_direct_n5_tp_rand5_react_Qwen/Qwen3.5-9B` | 79742 | alive, 0/165 (first pkl not landed yet) |
+| run | dir | pid |
+|---|---|---:|
+| gpt-4o | `tracelet_direct_n5_tp_exp5_react_gpt-4o` | 37892 |
+| gpt-5.4-mini | `tracelet_direct_n5_tp_exp5_react_gpt-5.4-mini` | 37893 |
+| Qwen3.5-9B | `tracelet_direct_n5_tp_exp5_react_Qwen/Qwen3.5-9B` | 37894 |
 
-Logs in `scratchpad/random_control/`. Everything else — naive/n=1/n=3/n=5 filter-on baselines for
-all four models, goal-pruning for all four models, n=1 Qwen3.5-9B — is complete at 165/165.
-Residual, not-yet-cleaned-up error counts on old runs: naive Qwen3.7-Plus 3, n=1 Qwen3.7-Plus 1,
-n=3 Qwen3.7-Plus 1, n=5 Qwen3.5-9B 1, goal-pruning Qwen3.7-Plus 5 — likely the model's known
-reproducible content-filter 400s rather than transient bursts; check before quarantining.
+(Restarted 2026-09-14 at user request while all three were healthy and progressing — not a
+recovery from a stall. Resumed cleanly from cache at 10/165, 15/165, 2/165.)
+
+Directly comparable to `_v6n5` (scores judge) and `_rand5` (random control) — same model/n/
+filter/max-steps, only the judge differs. Qwen3.7-Plus excluded (provider caps n at 4). When these
+finish: pair each against `_v6n5` (accuracy McNemar + tokens/steps) the same way the random control
+was compared — this is the real-accuracy test of whether the "expectation" judge's much better
+ESS/n discrimination (see below) translates into better GAIA scores, not just a cleaner diagnostic.
+
+Older: the three n=5 random-selection sweeps below finished 2026-09-12/13 (one needed a restart —
+mini and Qwen3.5-9B had each accumulated a large contiguous block of cached `Connection error`
+pickles from a long outage, quarantined to `_backup_errors_20260912/` and recomputed cleanly on
+relaunch). Everything else — naive/n=1/n=3/n=5 filter-on baselines for all four models,
+goal-pruning for all four models — is complete at 165/165. Residual, not-yet-cleaned-up error
+counts on old runs: naive Qwen3.7-Plus 3, n=1 Qwen3.7-Plus 1, n=3 Qwen3.7-Plus 1, n=5 Qwen3.5-9B 1,
+goal-pruning Qwen3.7-Plus 5 — likely the model's known reproducible content-filter 400s rather than
+transient bursts; check before quarantining.
+
+**Random-selection control result (the decisive test from below), n=5, vs `_v6n5`:**
+
+| model | judge accuracy | random accuracy | McNemar p | judge tokens/q | random tokens/q |
+|---|---|---|---:|---:|---:|
+| gpt-4o | 55/165 = 33.3% | 40/165 = 24.2% | **0.014** | 267,970 | 274,973 |
+| gpt-5.4-mini | 58/165 = 35.2% | 63/165 = 38.2% | 0.533 | 156,805 | 179,450 |
+| Qwen3.5-9B | 79/165 = 47.9% | 80/165 = 48.5% | 1.000 | 601,707 | 607,643 |
+
+Judge beats random significantly only for gpt-4o; for mini and Qwen3.5-9B, judge selection is
+statistically indistinguishable from picking uniformly at random. Consistent across all three:
+judge selection uses fewer tokens/steps than random regardless of the accuracy outcome, so it may
+be doing something for efficiency even where it isn't for correctness.
 
 ## Random-selection control at n=5 (launched 2026-09-12)
 
@@ -128,6 +433,156 @@ uses **fewer steps** than n=3 (gpt-4o 10.6 -> 9.9, mini 8.2 -> 6.9), the opposit
 so the step-reduction effect may need more than three candidates to outweigh protocol overhead.
 Accuracy differences remain within noise on both models.
 
+## Beam search + probabilistic-program trace format (designed 2026-09-13/14, not implemented)
+
+Prompted by the random-selection control above: since the judge barely beats chance for 2 of 3
+models, the natural next question is whether *search* (not just per-step selection) is where the
+value would come from. Sketched but deliberately not built yet — parked here per the established
+"sideline it" pattern, same as the redundancy-pruning judge below.
+
+**Why beam search, motivated by data, not just architecture appeal:** two uniqueness experiments
+this session (`traceletReAct_single.ipynb`, 5 independent live re-runs of the same GAIA question)
+showed diversity lives almost entirely *across* full trajectories, not *within* one step's n
+fill-in candidates:
+- n=5 fill-ins on a fixed skeleton: 45-85% of steps have >=1 duplicate candidate (measured
+  earlier, `notes.ipynb` cells `9ce8fe10`/`fb9378d9`).
+- 5 fully independent trajectories on Q112 (gpt-5.4-mini via TraceletCodeAgent): **0/70 and 0/50
+  triplets repeated across two separate 5-run batches** — full-trajectory resampling gets
+  essentially zero-repeat diversity, because a free-text "thought" at the API default temperature
+  (1.0 — `_sample_skeleton_direct_prompt`/`_post_process` pass no explicit `temperature`) almost
+  never reproduces verbatim, unlike a short constrained fill-in value.
+- Dropping thought from the key (action+fill-in only) recovers a *few* genuine repeats — 3/50 and
+  6/70 — driven by convergence at `final_answer(...)` calls (a small discrete space of plausible
+  guesses), not by search-query convergence as originally guessed.
+- **naiveReAct vs TraceletCodeAgent comparison, same question, same model:** naiveReAct showed
+  *more* duplication (94.1%/70.9% unique on Q112/Q1) than tracelet's 100%/100% — but the mechanism
+  was a genuine bug, not convergent reasoning: gpt-5.4-mini running plain `CodeAgent` (default
+  `code_agent.yaml`, no tracelet protocol) sometimes returns a **completely empty completion**
+  (`model_output==""`, `error=None`, `observation="...Last output...None"`) for several consecutive
+  steps — happened in 4/5 independent Q1 runs, never in any tracelet run. Root cause unconfirmed
+  (plausibly the model spending its turn on hidden reasoning tokens with nothing left for visible
+  output); the tracelet protocol prompt appears to incidentally suppress this. Qwen3.5-9B showed no
+  such artifact on the same question (4/5 correct vs mini's 2/5).
+
+**Beam search sketch:** a `Beam` = partial trajectory (history, a *persisted* tool-state snapshot,
+cumulative score). At each depth, every beam branches into `branch_factor` full step resamples
+(thought+skeleton+fill-in, not just fill-in on one fixed skeleton — diversity needs the whole step
+resampled, per the finding above), each is scored (`combine(prior_logprob, likelihood_score)`,
+any of the 9 rules from `notes.ipynb` `e7abb006`), and only the top `beam_width` survive. This
+generalizes today's per-step candidate-snapshot machinery (`TraceletCodeAgent._execute_candidates`)
+to persist across *multiple* steps rather than being scored and discarded within one — the real
+engineering cost is `beam_width` separate live tool states (browser position, etc.) carried
+forward, not just `n_samples` transient ones.
+
+**Framed as inference over a probabilistic program:** `TraceletCodeAgent` already defines the
+generative model `∏_t P_prior(action_t) · P_likelihood(evidence_t)`; beam search is truncated
+Viterbi over that joint (keep top-B partial-sequence scores per depth, discard the rest). Full
+best-of-n (today's implementation) is the degenerate depth-1 case. Known gap: greedy top-B pruning
+is not a properly-weighted particle filter — a beam cut at step 3 for scoring slightly lower might
+have led to the best step 7, and there is no resampling-with-replacement to give it a chance the
+way real SMC would.
+
+**Custom-DSL trace format (user's choice over an existing PPL library):** compile the *search
+tree*, not just the winning path, since that is the part a flat trajectory pickle can't already
+represent:
+```python
+Choice(id, step, beam_id, parent_beam_id, thought, action, fillin, prior_logprob)
+Evidence(choice_id, observation, likelihood_score)
+Prune(step, kept_beam_ids, discarded_beam_ids, cumulative_scores)
+Trace(question, choices, evidence, prunes, winner_beam_id)
+```
+Following `parent_beam_id` back to the root lets any beam's score be recomputed offline under a
+*different* combination rule (any of the 9), purely by replaying `choices`/`evidence` — no LLM
+calls, same replay-only pattern as `traceletReAct_trajectory.ipynb`. Worked a full 3-step toy
+example by hand (Q112) showing prior-alone pruning would have kept a dead-end IMDb-error branch
+over the branch that actually confirmed the correct answer via an independent path — concrete
+evidence that judge-informed and prior-only search diverge on *which branch survives*, not just on
+final accuracy. Hard limitation: a `Prune` record only holds the score *at the moment of
+discarding* — it cannot answer "what would this branch have scored at step 10," since it was never
+executed past step 3.
+
+### Likelihood-source investigation (2026-09-14) — two self-assessment methods tested, both rejected
+
+Before wiring any scoring rule into a beam, tested whether an LLM can usefully self-assess
+multi-step trajectory success, offline, against 85 already-completed `naive_react_gpt-5.4-mini_False_filteron`
+prefixes (30 questions, stratified 15 correct/15 incorrect, cut at ~25%/60%/90% of each
+trajectory's length, ground truth never shown to the judge). Scripts in
+`scratchpad/trajectory_success_calibration.py` (logprob) and `..._verbalized.py` (direct
+verbalization); raw results in `baseline/trajectory_success_calibration.json` and
+`..._verbalized.json`.
+
+| method | corr(p, is_correct) | Brier (0.25 = always predict 0.5) |
+|---|---:|---:|
+| P(yes) from logprobs (`completion_judge.py`-style) | 0.085 | **0.407** — worse than the constant baseline |
+| direct verbalized percentage | 0.151 | 0.283 — close to, still not beating, baseline |
+
+Both share the decision-relevant failure: confidence rises monotonically with more of the
+trajectory shown while real accuracy stays flat (~50%) or ticks down — e.g. logprob method's Brier
+gets *worse* going from 25% (0.367) to 90% (0.452) shown. Reads as the model inferring "looks
+complete/confident" rather than verifying correctness, which is exactly the regime beam-search
+pruning lives in (comparing partial paths as they grow). **Both methods rejected as a likelihood
+source; do not wire either into beam search.**
+
+Side-finding, orthogonal to the calibration failure: logprob-extracted P(yes) values are not
+continuous — every one of the 85 values decomposes exactly as `sigmoid(k * 0.25)` for integer k
+(confirmed by inverting each value back to its logit and checking it lands on the 0.25 grid with no
+exceptions). OpenAI's returned logprobs for this kind of binary read are quantized to ~0.25-nat
+increments, capping resolution at a couple dozen distinguishable confidence levels regardless of
+prompt/task quality — likely explains part of why the original per-step judge's 0-10 scores looked
+clustered/discrete rather than smooth (see the score-distribution histograms in `notes.ipynb`).
+Verbalized percentages have their own, different clustering problem instead: heavy weight on a
+handful of "favorite" numbers (78 chosen 17/85 times, 62 chosen 11/85, 72 chosen 10/85) rather than
+smooth variation — trading the API's quantization grid for the model's own round-number bias.
+
+**Recommended likelihood source instead, not yet built:** cross-beam agreement (do independent
+branches converge on the same conclusion — free once multiple beams exist, no extra LLM call, and
+directly motivated by the worked toy example above where two independently-searched branches
+corroborating each other was a stronger and cheaper signal than either one's judge score) combined
+with a hard objective-execution floor (never let an errored candidate beat a clean one — closes the
+one unambiguous failure already measured in the judge-effectiveness diagnostic, 0.53% of steps).
+
+### A third self-assessment prompt tried after the two above — this one looks genuinely promising
+
+Third variant, closer to `completion_judge.py`'s framing but reading the expectation out of the
+free-form thought instead of requiring a structured `Expectation:` line: **"Does the output of
+this step achieve what the model expected in the thought?"**, yes/no + logprob extraction, judged
+per step (not a multi-step forecast like the two rejected methods above). Scripts in
+`scratchpad/step_judge_thought_expectation.py` (per-step calibration, 213 steps from the same
+30-question `naive_react_gpt-5.4-mini_False_filteron` sample) and `..._ess_headtohead.py` (applied
+per-candidate to `tracelet_direct_n5_tp_v6n5_react_gpt-5.4-mini`, to compare ESS/n directly against
+the production judge).
+
+| check | result |
+|---|---|
+| corr(mean per-step P(yes) over a trajectory, trajectory `is_correct`) | **0.528** (vs 0.085 and 0.151 for the two rejected trajectory-forecast methods), Brier 0.265 |
+| mean P(yes), errored steps vs clean steps | 0.028 vs 0.224 — correctly downgrades errors |
+| mean P(yes), steps in eventually-correct vs -incorrect trajectories | 0.271 vs 0.131 |
+| objective failures (errored step judged P(yes)>0.5) | 1/36 (2.8%) |
+
+Caveat: it's a strict judge (139/213 = 65% of all judgments are exactly 0.0) — most individual
+ReAct steps are exploratory and genuinely don't "achieve what was expected" in isolation, so the
+raw score is a useful *relative ranking* signal, not a calibrated absolute probability.
+
+**Head-to-head ESS/n vs the production judge** (`scratchpad/new_judge_ess_headtohead.py`, 30
+multi-candidate steps from `tracelet_direct_n5_tp_v6n5_react_gpt-5.4-mini`, same per-step prompt
+applied to each candidate against its shared thought, raw results in
+`baseline/new_judge_ess_headtohead.json`):
+
+| metric | production judge (n=4,867) | new judge (n=30) |
+|---|---:|---:|
+| mean ESS/n | 0.90-0.94 | **0.791** |
+| near-uniform (ESS/n >= 0.95) | 74.3% | **63.3%** |
+| real discrimination (ESS/n < 0.5) | 3.9% | **20.0%** (5x) |
+| objective failures (errored candidate preferred) | 0.53% | **0.00%** (0/30) |
+
+Wins on every metric. One nuance: many of this judge's "near-uniform" cases are literally all n
+candidates scoring `p_yes=0` -- a defensible "none of these achieved it" verdict with no way to
+rank equally-bad options under strict yes/no, not the production judge's failure mode of giving
+everything a similar *mediocre* score. Sample is small (30 vs 4,867 steps) so exact percentages
+would tighten with more data, but the direction agrees with the 0.528 trajectory-level correlation
+above -- **this is the most promising judge design found this session; a real candidate to replace
+the current 0-10 `judge_strategy="scores"`**, not just another rejected self-assessment attempt.
+
 ## Decisions waiting on me
 
 - **Keep Qwen3.7-Plus at all, or swap in a different fourth model?** The immediate trigger is that
@@ -176,9 +631,9 @@ Accuracy differences remain within noise on both models.
 
 ## Experiments worth running, highest value first
 
-1. **Random-selection control.** ~~At n=3~~ — **launched at n=5 2026-09-12**, see the section
-   above; results pending. n=1 vs n=3 was p≈0.87 with ~20% of answers flipping symmetrically, so
-   if random matches the judge, the judge contributes nothing.
+1. ~~**Random-selection control.**~~ Done — see "Runs in flight" above. Judge beats random only
+   for gpt-4o (p=0.014); mini and Qwen3.5-9B show no detectable benefit from judge selection over
+   chance at n=5.
 2. **Trajectory-level marginalisation + a verifier.** Oracle union over two n=3 draws is
    **+12.5pp** (gpt-4o 27.5%→40.0%) and **+11.2pp** (mini 36.1%→47.3%). That is the measured
    headroom; the open question is whether a verifier can capture a third of it.
