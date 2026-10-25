@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from smolagents.memory import ActionStep, Timing
 from smolagents.models import ChatMessage, MessageRole
@@ -11,6 +11,7 @@ from smolagents.tracelet_agent import (
     _parse_fillin_lines,
     _parse_scores,
     _sentinelize_tool_calls,
+    _Trial,
 )
 from smolagents.utils import AgentExecutionError, AgentParsingError
 
@@ -576,6 +577,58 @@ class TestParseScores(unittest.TestCase):
 
     def test_unparseable_output_defaults_to_zeros(self):
         self.assertEqual(_parse_scores("no scores here", 2), [0.0, 0.0])
+
+
+class TestJudgeExpectationStrategy(unittest.TestCase):
+    """judge_strategy="expectation": one judge_step_achieved_expectation call per candidate,
+    picking whichever achieved what its thought expected -- see TODO.md for why this strategy
+    was added (measured ~5x more discriminating than the default "scores" judge)."""
+
+    def _agent(self):
+        return TraceletCodeAgent(
+            tools=[], model=MagicMock(), n_samples=1, judge_strategy="expectation", verbosity_level=LogLevel.ERROR
+        )
+
+    def _trials(self, n):
+        return [_Trial(code=f"code_{i}", observation=f"obs_{i}") for i in range(n)]
+
+    def test_picks_the_highest_p_yes_candidate(self):
+        agent = self._agent()
+        usage = TokenUsage(input_tokens=10, output_tokens=5)
+        p_yes_by_call = [0.2, 0.9, 0.1]
+        with patch(
+            "smolagents.tracelet_agent.judge_step_achieved_expectation",
+            side_effect=[(p, "yes" if p > 0.5 else "no", usage) for p in p_yes_by_call],
+        ):
+            winner_index, probs, total_usage = agent._judge_expectation("thought", self._trials(3))
+        self.assertEqual(winner_index, 1)
+        self.assertAlmostEqual(sum(probs), 1.0)
+        self.assertGreater(probs[1], probs[0])
+        self.assertGreater(probs[1], probs[2])
+        self.assertEqual(total_usage.input_tokens, 30)
+        self.assertEqual(total_usage.output_tokens, 15)
+
+    def test_falls_back_to_uniform_when_every_candidate_scores_zero(self):
+        agent = self._agent()
+        usage = TokenUsage(input_tokens=1, output_tokens=1)
+        with patch(
+            "smolagents.tracelet_agent.judge_step_achieved_expectation",
+            side_effect=[(0.0, "no", usage), (0.0, "no", usage)],
+        ):
+            winner_index, probs, _ = agent._judge_expectation("thought", self._trials(2))
+        self.assertEqual(probs, [0.5, 0.5])
+        self.assertIn(winner_index, (0, 1))
+
+    def test_unparseable_answer_is_treated_as_zero_not_a_crash(self):
+        agent = self._agent()
+        usage = TokenUsage(input_tokens=1, output_tokens=1)
+        with patch(
+            "smolagents.tracelet_agent.judge_step_achieved_expectation",
+            side_effect=[(None, "unparseable", usage), (0.8, "yes", usage)],
+        ):
+            winner_index, probs, _ = agent._judge_expectation("thought", self._trials(2))
+        self.assertEqual(winner_index, 1)
+        self.assertEqual(probs[0], 0.0)
 
 
 if __name__ == "__main__":
