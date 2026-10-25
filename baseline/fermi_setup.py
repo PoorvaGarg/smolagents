@@ -16,7 +16,10 @@ import pint
 import requests
 
 FERMI_RAW_BASE = "https://raw.githubusercontent.com/allenai/fermi/main"
-_DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data" / "fermi"
+# Kept outside the repo so the agent's Python can't read answers via a relative path.
+_DEFAULT_DATA_DIR = Path(
+    os.getenv("BENCHMARK_DATA_DIR", Path(__file__).resolve().parents[2] / ".benchmark_data")
+) / "fermi"
 
 FERMI_ANSWER_INSTRUCTION = (
     "\n\nGive your final answer as a number with units matching the question (e.g. \"22.3 km\", "

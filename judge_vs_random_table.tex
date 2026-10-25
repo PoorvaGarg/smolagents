@@ -1,0 +1,21 @@
+\documentclass{article}
+\usepackage{booktabs}
+
+\begin{document}
+
+\begin{table}[h]
+\centering
+\caption{GAIA accuracy at $n=5$: LLM-as-a-judge selection vs.\ random selection}
+\label{tab:judge-vs-random}
+\begin{tabular}{lcc}
+\toprule
+Model & $n=5$, LLM-as-judge & $n=5$, random selection \\
+\midrule
+gpt-4o       & 33.3\% & 24.2\% \\
+gpt-5.4-mini & 35.2\% & 38.2\% \\
+Qwen3.5-9B   & 47.9\% & 48.5\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

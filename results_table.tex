@@ -1,0 +1,22 @@
+\documentclass{article}
+\usepackage{booktabs}
+
+\begin{document}
+
+\begin{table}[h]
+\centering
+\caption{GAIA accuracy: naive ReAct vs.\ Probabilistic ReAct (Tracelet), $n=1,3,5$}
+\label{tab:naive-vs-tracelet}
+\begin{tabular}{lcccc}
+\toprule
+Model & naive & $n=1$ & $n=3$ & $n=5$ \\
+\midrule
+gpt-4o        & 27.9\% & 29.1\% & 27.9\% & 33.3\% \\
+gpt-5.4-mini  & 30.3\% & 40.6\% & 35.2\% & 35.2\% \\
+Qwen3.5-9B    & 52.1\% & 40.6\% & 47.9\% & 47.9\% \\
+Qwen3.7-Plus  & 57.0\% & 60.6\% & 63.6\% & n/a    \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

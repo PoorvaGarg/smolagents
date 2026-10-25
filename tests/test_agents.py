@@ -1791,6 +1791,7 @@ class TestToolCallingAgent:
         class MockChoice:
             def __init__(self, delta):
                 self.delta = delta
+                self.index = 0
 
         class MockChunk:
             def __init__(self, delta):

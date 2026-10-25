@@ -142,6 +142,24 @@ keep reasoning out of these comparisons.
 `tracelet_direct_tp_v5n3_react_Qwen/Qwen3.5-9B` was first run to 50 questions and later extended;
 its indices 47-49 errored transiently and were re-run (originals in `_backup_errors/`).
 
+## Multi-trajectory pilot: naive CodeAgent, 5 independent trajectories with logprobs
+
+Script: `run_multi_trajectory_sweep.py`, one process per (model, dataset). Exact settings are in
+each run's `config.json`.
+
+| directory | models | datasets | per run | key settings |
+|---|---|---|---|---|
+| `multitraj_mt2/<dataset>/<model>/traj{0..4}/` (launched 2026-10-25) | gpt-4o, gpt-5.4-mini, Qwen3.5-9B | gaia, fermi, math500, simpleqa | first 20 questions × 5 trajectories | temperature 1.0; logprobs with top-5 alternatives (pickle `step_logprobs`); leak filter **v2** (search + visit + file inspection); executor state reset per question; sandboxed cwd; **executor timeout 300s**; search 0.1 q/s/process (12 concurrent); max_steps 50 |
+| `multitraj_mt1/` | — | — | — | **Abandoned after a few minutes; do not use.** It had the same settings but the default 30s executor timeout, which the rate-limit sleeps at 0.1 q/s tripped on ordinary multi-search code blocks. Its 161 partial pickles were kept but superseded by `_mt2`. |
+
+Not directly comparable to the baselines above: those runs used leak filter v1 (which let direct
+visits to dataset mirrors through), had no per-question executor reset (Python variables leaked
+between questions), ran from the repo cwd, and used the 30s timeout at 1.0 q/s.
+
+Scoring: MATH-500 `grade_label` is `CORRECT_STRICT` / `CORRECT_TOLERANCE` / `INCORRECT`; count
+only `CORRECT_STRICT` for literature-comparable numbers. SimpleQA `grade_label` is the official
+grader's CORRECT / INCORRECT / NOT_ATTEMPTED.
+
 ## One-off diagnostics
 
 | directory | what it was for |

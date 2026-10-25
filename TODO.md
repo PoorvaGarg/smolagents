@@ -356,7 +356,10 @@ once step 11 succeeds.
 ## Known defects and debt
 
 - **`python_executor.state` is never cleared between questions.** `run(reset=True)` resets memory
-  and the monitor but not executor state, so variables leak across all 165 questions. Unfixed.
+  and the monitor but not executor state, so variables leak across all 165 questions. Confirmed
+  live on 2026-10-25: question 2 read a variable set in question 1. Fixed **opt-in** with
+  `evaluate_agent(..., reset_executor_state=True)`, which `run_multi_trajectory_sweep.py` uses.
+  Every older sweep and notebook still has the leak.
 - **`extract_primary_tool` iterates a `set`.** With randomised string hashing the "primary" tool
   on a line with two tool calls varies between processes, so pruning is not reproducible.
 - **Context pruning prunes the wrong group hardest.** 54-56% of dropped steps are `browse` chains,

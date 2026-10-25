@@ -1,0 +1,20 @@
+\documentclass{article}
+\usepackage{booktabs}
+
+\begin{document}
+
+\begin{table}[h]
+\centering
+\caption{GAIA accuracy: naive ReAct vs.\ beam search ($w{=}5$, $b{=}2$), 1-best and pass@5}
+\label{tab:beam-search-pass5}
+\begin{tabular}{lccc}
+\toprule
+Model & Naive accuracy & Beam search 1-best & Beam search pass@5 \\
+\midrule
+gpt-4o      & 27.9\% & 38.8\% & 51.5\% \\
+Qwen3.5-9B  & 52.1\% & 47.9\% & 58.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

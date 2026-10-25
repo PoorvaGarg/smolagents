@@ -138,12 +138,33 @@ class DuckDuckGoSearchTool(Tool):
         self.ddgs = DDGS(**kwargs)
 
     def forward(self, query: str) -> str:
-        self._enforce_rate_limit()
-        results = self.ddgs.text(query, max_results=self.max_results)
-        if len(results) == 0:
-            raise Exception("No results found! Try a less restrictive/shorter query.")
+        results = self._search_with_retry(query)
         postprocessed_results = [f"[{result['title']}]({result['href']})\n{result['body']}" for result in results]
         return "## Search Results\n\n" + "\n\n".join(postprocessed_results)
+
+    def _search_with_retry(self, query: str, max_retries: int = 4, backoff: float = 3.0) -> list[dict]:
+        """ddgs aggregates results across several scraped search engines and raises a generic
+        DDGSException("No results found") whenever all of them fail for one call -- often a
+        transient block/rate-limit on the scraping backend rather than a genuinely empty result
+        set (the same query routinely succeeds seconds later). Retry with exponential backoff
+        before giving up, instead of treating the first failure as final.
+        """
+        import time
+
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            self._enforce_rate_limit()
+            try:
+                results = self.ddgs.text(query, max_results=self.max_results)
+            except Exception as e:
+                last_error = e
+            else:
+                if results:
+                    return results
+                last_error = Exception("No results found! Try a less restrictive/shorter query.")
+            if attempt < max_retries - 1:
+                time.sleep(backoff * (2**attempt))
+        raise last_error
 
     def _enforce_rate_limit(self) -> None:
         import time

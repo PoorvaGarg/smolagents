@@ -1,0 +1,21 @@
+\documentclass{article}
+\usepackage{booktabs}
+
+\begin{document}
+
+\begin{table}[h]
+\centering
+\caption{GAIA accuracy: naive ReAct vs.\ GoalPruningCodeAgent, and the resulting token change}
+\label{tab:goal-pruning-vs-naive}
+\begin{tabular}{lccc}
+\toprule
+Model & Naive accuracy & Goal-pruning accuracy & Tokens $\Delta$ \\
+\midrule
+gpt-4o        & 27.9\% & 33.3\% & $-46.6\%$ \\
+gpt-5.4-mini  & 30.3\% & 27.9\% & $+36.0\%$ \\
+Qwen3.5-9B    & 52.1\% & 32.7\% & $-31.5\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

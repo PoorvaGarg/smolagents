@@ -29,7 +29,11 @@ if str(_ODR_DIR) not in sys.path:
 
 from smolagents import DuckDuckGoSearchTool
 from smolagents.memory import ActionStep
-from benchmark_leak_filter import LeakFilteredDuckDuckGoSearchTool
+from benchmark_leak_filter import (
+    LeakFilteredDuckDuckGoSearchTool,
+    LeakFilteredTextBrowser,
+    LeakFilteredTextInspectorTool,
+)
 from scripts.run_agents import get_single_file_description, get_zip_description
 from scripts.text_inspector_tool import TextInspectorTool
 from scripts.text_web_browser import (
@@ -42,6 +46,22 @@ from scripts.text_web_browser import (
     VisitTool,
 )
 from scripts.visual_qa import visualizer
+
+
+def extract_logprobs(chat_message) -> list[dict] | None:
+    """Per-token {token, logprob, top_logprobs} from a ChatMessage's raw response, or None if absent."""
+    choices = getattr(getattr(chat_message, "raw", None), "choices", None)
+    content = getattr(getattr(choices[0], "logprobs", None), "content", None) if choices else None
+    if not content:
+        return None
+    return [
+        {
+            "token": tok.token,
+            "logprob": tok.logprob,
+            "top_logprobs": [{"token": alt.token, "logprob": alt.logprob} for alt in (tok.top_logprobs or [])],
+        }
+        for tok in content
+    ]
 
 
 def assert_no_reasoning(memory_step, agent=None):
@@ -59,7 +79,10 @@ def build_tools(model):
     )
     # Overridable so parallel sweeps don't race on identically-named downloads.
     downloads_dir = os.getenv("SMOLAGENTS_DOWNLOADS_DIR", "downloads_folder")
-    browser = SimpleTextBrowser(
+    # Answer-key leakage is a defect, so filtering is on by default; set to 0 to reproduce older runs.
+    filter_leaks = os.getenv("SMOLAGENTS_FILTER_LEAKS", "1") == "1"
+    browser_cls = LeakFilteredTextBrowser if filter_leaks else SimpleTextBrowser
+    browser = browser_cls(
         viewport_size=1024 * 5,
         downloads_folder=downloads_dir,
         serpapi_key=os.getenv("SERPAPI_API_KEY"),
@@ -67,10 +90,9 @@ def build_tools(model):
     )
     os.makedirs(downloads_dir, exist_ok=True)
 
-    ti_tool = TextInspectorTool(model, text_limit=100000)
+    ti_cls = LeakFilteredTextInspectorTool if filter_leaks else TextInspectorTool
+    ti_tool = ti_cls(model, text_limit=100000)
 
-    # Answer-key leakage is a defect, so filtering is on by default; set to 0 to reproduce older runs.
-    filter_leaks = os.getenv("SMOLAGENTS_FILTER_LEAKS", "1") == "1"
     # Lower this when several sweeps run at once, so they don't collectively trip DuckDuckGo throttling.
     search_rps = float(os.getenv("SMOLAGENTS_SEARCH_RPS", "1.0"))
     cls = LeakFilteredDuckDuckGoSearchTool if filter_leaks else DuckDuckGoSearchTool
@@ -100,7 +122,8 @@ def load_gaia_dataset(set_to_run: str = "validation", data_dir: str = "data/gaia
             repo_id="gaia-benchmark/GAIA",
             repo_type="dataset",
             local_dir=data_dir,
-            ignore_patterns=[".gitattributes", "README.md"],
+            # metadata*.parquet holds the answers; attachments are all we need from the snapshot.
+            ignore_patterns=[".gitattributes", "README.md", "*metadata*"],
         )
 
     eval_ds = datasets.load_dataset("gaia-benchmark/GAIA", "2023_all", split=set_to_run)
@@ -175,6 +198,8 @@ def evaluate_agent(
     pickle_dir="gaia_results",
     scorer=question_scorer,
     question_suffix=None,
+    capture_logprobs=False,
+    reset_executor_state=False,
 ):
     examples = dataset.to_list()
     if n_samples:
@@ -187,7 +212,9 @@ def evaluate_agent(
 
     # Tools are built once and reused for every question, so they can't name their own log file
     # or know which question is running. An explicit log_path (or SMOLAGENTS_LEAK_LOG) wins.
-    drop_loggers = [t for t in agent.tools.values() if getattr(t, "logs_drops", False) is True]
+    # The leak-filtering browser isn't a tool itself; it's shared by the navigation tools as .browser.
+    candidates = list(agent.tools.values()) + [getattr(t, "browser", None) for t in agent.tools.values()]
+    drop_loggers = list({id(c): c for c in candidates if getattr(c, "logs_drops", False) is True}.values())
     for tool in drop_loggers:
         tool.log_path = tool.log_path or str(pickle_path.parent / f"{pickle_path.name}_leakdrops.jsonl")
     if drop_loggers:
@@ -240,6 +267,12 @@ def evaluate_agent(
         if question_suffix:
             augmented_question += question_suffix
 
+        # run(reset=True) clears memory only; Python variables otherwise leak in from earlier questions.
+        if reset_executor_state:
+            agent.state = {}
+            if getattr(agent, "python_executor", None) is not None:
+                agent.python_executor.state = {"__name__": "__main__"}
+
         start_time = datetime.now()
         try:
             prediction = str(agent.run(augmented_question, reset=True))
@@ -249,7 +282,10 @@ def evaluate_agent(
             error = str(e)
         time_taken = (datetime.now() - start_time).total_seconds()
 
-        is_correct = scorer(prediction, example["true_answer"]) if prediction else False
+        scorer_kwargs = {"question": example["question"]} if getattr(scorer, "takes_question", False) else {}
+        is_correct = scorer(prediction, example["true_answer"], **scorer_kwargs) if prediction else False
+        # LLM-judge scorers expose their label; None means the agent produced no answer to grade.
+        grade_label = getattr(scorer, "last_label", None) if prediction else None
 
         action_steps = [s for s in agent.memory.steps if isinstance(s, ActionStep)]
         num_steps = len(action_steps)
@@ -284,12 +320,17 @@ def evaluate_agent(
             "token_counts": token_counts.dict(),
             "tokens_per_step": tokens_per_step,
             "error": error,
+            "grade_label": grade_label,
             "steps": [step.dict() for step in action_steps],
         }
         results.append(result)
 
         with open(output_path, "a") as f:
             f.write(json.dumps(result) + "\n")
+
+        # Logprobs go in the pickle only, to keep the jsonl small.
+        if capture_logprobs:
+            result["step_logprobs"] = [extract_logprobs(step.model_output_message) for step in action_steps]
 
         with open(pickle_path / f"{i}.pkl", "wb") as f:
             pickle.dump(result, f)

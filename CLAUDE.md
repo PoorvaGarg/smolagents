@@ -234,11 +234,58 @@ directory contains (model, n, filter status, search rate, date).
   This is a large, model-dependent confound, not a footnote — e.g. turning it on cost naive
   gpt-4o -8.9pp and Qwen3.7-Plus -10.3pp, but under -2pp on the other two models. Never compare a
   filter-off run against a filter-on run without checking `RUNS.md` first.
+  **Filter v2 (`LEAK_FILTER_VERSION = 2`, 2026-10-25)** covers all four datasets (GAIA, Fermi,
+  MATH-500, SimpleQA). It also blocks page *visits*, through `LeakFilteredTextBrowser._fetch_page`:
+  by URL before fetching, by content after. That covers visit_page, downloads, and archive
+  snapshots. v1 only screened search results, and its HF pattern checked only the org name. An
+  audit of past trajectories found agents in filter-on (v1) runs calling `visit_page` directly on
+  HF GAIA mirrors (e.g. `zyang39/GAIA`), so **v1 "filter-on" results are not leak-free**. Visit
+  blocks go to the same `_leakdrops.jsonl` with `"kind": "visit"`. Known unblocked source: AoPS
+  wiki solutions to the AMC/AIME problems behind MATH, because it's a legitimate math resource.
+  **Local answer files** live outside the repo in `/space/poorvagarg/.benchmark_data/`
+  (`$BENCHMARK_DATA_DIR`; see its README). The agent's Python has `io`/`pandas` and once tried to
+  `io.open` GAIA's `metadata.jsonl`. GAIA `metadata*.parquet` was moved there and is skipped on
+  re-download; Fermi/SimpleQA loaders read from there. `LeakFilteredTextInspectorTool` blocks the
+  agent's `inspect_file_as_text` on answer files by path and by content; the harness's own
+  attachment preprocessing, via `forward_initial_exam_mode`, is unaffected. Residual risk: absolute
+  paths (the HF cache, `.benchmark_data`) and run-output files (`*.jsonl`/`*.pkl` in `baseline/`
+  contain `true_answer`) are still readable by the agent's Python if it guesses the path.
 - **Liveness**: CPU delta does not distinguish a working run from a hung one (both sit near
   0.14s CPU per 25s wall time — the work is I/O-bound). Use pickle-count growth and the newest
   file's mtime instead. A run that survives a laptop sleep typically leaves a *contiguous* block
   of `Connection error` pickles at the point of interruption — that pattern, not a scattered one,
   is the signature to look for.
+- **Datasets and scorers**: each loader returns the same `question/true_answer/task/file_name/
+  task_id` shape, so `evaluate_agent` takes any of them via its `scorer=` argument. GAIA uses
+  `question_scorer` (`common_setup.py`). Fermi uses `fermi_scorer` (`fermi_setup.py`, a
+  continuous 0-1 score). MATH-500 uses `math500_scorer` (`math500_setup.py`), which wraps OpenAI's
+  **PRM800K grader**, vendored in `baseline/third_party/prm800k_grading/`. That grader goes with
+  MATH-500's own provenance and does a sympy-equivalence check; provenance, the pinned commit, and
+  the one-line patch are recorded in that directory's `README.md`. On top of that, our own
+  extension accepts numeric matches within `REL_TOL=1e-6` when strict grading fails (for agents
+  returning Python floats). The verdict is labeled `CORRECT_STRICT` / `CORRECT_TOLERANCE` /
+  `INCORRECT`; count only `CORRECT_STRICT` for literature-comparable numbers. SimpleQA uses `SimpleQAGrader`
+  (`simpleqa_setup.py`), the official LLM-judge prompt from `openai/simple-evals`, vendored in
+  `baseline/third_party/simpleqa_grading/` (gpt-4.1-2025-04-14, matching upstream). Because it
+  needs the question, it sets `takes_question = True`, which makes `evaluate_agent` pass
+  `question=`. Its CORRECT/INCORRECT/NOT_ATTEMPTED verdict is saved as `grade_label` (`None` for
+  non-LLM scorers, or when the agent produced no answer).
+- **Logprobs**: build the model with `OpenAIModel(..., logprobs=True, top_logprobs=5)`. Model
+  constructor kwargs reach every API call. Then pass `evaluate_agent(..., capture_logprobs=True)`.
+  This adds `step_logprobs` to each pickle (not the jsonl): one entry per step, each a list of
+  `{token, logprob, top_logprobs}`. It works only on non-streaming models. `stream_outputs=True`
+  and Qwen3.7-Plus (streaming-only) lose them, because `agglomerate_stream_deltas` drops `raw`.
+  gpt-5.4-mini returns a variable 1-5 alternatives per token, not always 5.
+- **Multi-trajectory sweeps** (`baseline/run_multi_trajectory_sweep.py`): N independent naive
+  CodeAgent trajectories per question, with logprobs, one (model, dataset) pair per process,
+  selected via `SMOLAGENTS_MODEL` / `SMOLAGENTS_DATASET`. Each pass gets a fresh agent and tools,
+  and passes `reset_executor_state=True`. Without that flag, Python variables leak between
+  questions, because `run(reset=True)` only clears memory; this was verified, and it affects all
+  older sweeps. The agent's cwd is an empty sandbox in `/space/poorvagarg/.agent_sandbox/`, with
+  GAIA attachments copied in as relative `attachments/...` paths, so no repo path or
+  answer-bearing file is reachable relatively. Temperature is set explicitly (default 1.0), so
+  samples come from the distribution the logprobs describe. Outputs go to
+  `baseline/multitraj<RUN_TAG>/<dataset>/<model>/traj<k>/`, with a `config.json` per run.
 
 ### Testing conventions
 
