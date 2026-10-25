@@ -1,0 +1,3 @@
+gpt-5.4-mini	75996
+Qwen/Qwen3.5-9B	75997
+Qwen/Qwen3.7-Plus	75998
